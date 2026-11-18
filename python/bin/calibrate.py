@@ -1,11 +1,11 @@
-"""Energy calibration of the toy calorimeter (python/notebooks/calibrate.ipynb as a script).
+"""Energy calibration of the toy calorimeter (the former calibrate.ipynb notebook as a script).
 
   python3 calibrate.py --sensor-data <sims>/sensor_data.npz --em <photon sims> --had <pion sims> --out calib.npz
                        [--cut 0.0009] [--calo v4]
 
 Inputs are simulation libraries from run_simulations.py with simtype singlepart_face (the sim_calibration_dataset_em*
 and sim_calibration_dataset_had* sections of configuration/production.ini: photons and charged pions, 1.7 < eta < 2.8,
-filter_deposited=True). Steps, as in the notebook:
+filter_deposited=True). Steps (as in the notebook):
   1. sensors_scaling = (1 + pre-absorber thickness / sensor thickness) * 2.9 for every sensor
   2. g_em: least-squares fit of the photon energy to the summed scaled deposits
   3. g_had: the pion energy minus the EM-calibrated deposit in the EM layers, fitted to the summed scaled deposits in
@@ -15,6 +15,8 @@ Writes the sensor table with sensors_scaling (the calibration file create_datase
 response of the calibration samples. The constants have to be redone for every Geant4 version and detector variant.
 """
 import argparse
+import multiprocessing
+import os
 import time
 
 import numpy as np
@@ -24,14 +26,29 @@ from calo.event_generator import EventGenerator
 from calo.shards import sim_library
 
 
-def deposits(gen, sims, limit):
-    out, true = [], []
-    for i in range(min(limit, sims.get_total())):
-        sim, gun = sims.get_element(i)
+NOISE = ('type_a', 0, 5.2e-13)                             # negligible noise (as in the notebook)
+GEN_KW = dict(num_hits_cut=3, reduce=True, area_normed_cut=True, merge_closeby_particles=False, collect_truth=False)
+_JOB = {}                                                  # set before forking the workers (no pickling of 3M-sensor arrays)
+
+
+def _chunk(indices):
+    gen = EventGenerator(dict(_JOB['sd'], sensors_scaling=_JOB['scaling']), NOISE, cut=_JOB['cut'], **GEN_KW)
+    sims = sim_library(_JOB['path'])
+    out = []
+    for i in indices:
+        sim, gun = sims.get_element(int(i))
         gen.add([sim])
-        out.append(np.sum(gen.process()['rechit_energy']))
-        true.append(gun['energy'])
-    return np.array(out, np.float64), np.array(true, np.float64)
+        out.append((np.sum(gen.process()['rechit_energy']), gun['energy']))
+    return out
+
+
+def deposits(sd, scaling, cut, path, n, procs):
+    """Summed scaled deposit (after the noise cut) and true energy of the first n simulations of a library."""
+    _JOB.update(sd=sd, scaling=scaling, cut=cut, path=path)
+    chunks = [c for c in np.array_split(np.arange(n), max(1, min(procs, n) * 4)) if len(c)]
+    with multiprocessing.get_context('fork').Pool(min(procs, len(chunks))) as pool:
+        res = [r for part in pool.map(_chunk, chunks) for r in part]
+    return np.array([r[0] for r in res], np.float64), np.array([r[1] for r in res], np.float64)
 
 
 def main():
@@ -43,29 +60,27 @@ def main():
     ap.add_argument('--cut', type=float, default=0.0009)
     ap.add_argument('--limit', type=int, default=1000000, help='use at most this many simulations of each sample')
     ap.add_argument('--global-scale', type=float, default=2.9)
+    ap.add_argument('--procs', type=int, default=min(32, os.cpu_count() or 1))
     a = ap.parse_args()
 
     with np.load(a.sensor_data) as f:
         sd = {k: f[k] for k in f.files}
     em_layers = sd['sensors_active_layer_num'] < 2 * CaloGenerator().num_ee_layers
     base = (1 + sd['sensors_pre_absorber_thickness'] / sd['sensors_thickness']) * a.global_scale
-    noise = ('type_a', 0, 5.2e-13)                         # negligible noise, as in the notebook
-    kw = dict(num_hits_cut=3, reduce=True, area_normed_cut=True, merge_closeby_particles=False, collect_truth=False)
+    n_em, n_had = min(a.limit, sim_library(a.em).get_total()), min(a.limit, sim_library(a.had).get_total())
+    print("calibration samples: %d EM, %d hadronic; %d sensors; %d processes" % (n_em, n_had, len(base), a.procs))
 
-    def gen(scaling, cut):
-        return EventGenerator(dict(sd, sensors_scaling=scaling), noise, cut=cut, **kw)
-
-    em, had = sim_library(a.em), sim_library(a.had)
-    print("calibration samples: %d EM, %d hadronic; %d sensors" % (em.get_total(), had.get_total(), len(base)))
+    def dep(scaling, cut, path, n):
+        return deposits(sd, scaling, cut, path, n, a.procs)
 
     t = time.time()
-    em_dep, em_true = deposits(gen(base, a.cut), em, a.limit)
+    em_dep, em_true = dep(base, a.cut, a.em, n_em)
     g_em = float(np.linalg.lstsq(em_dep[:, None], em_true[:, None], rcond=None)[0][0, 0])
     print("EM calibration constant g_em = %.5f (%d photons, %.0f s)" % (g_em, len(em_dep), time.time() - t))
 
     t = time.time()
-    em_part, had_true = deposits(gen(np.where(em_layers, base * g_em, 0.0), 0.0), had, a.limit)
-    had_part, _ = deposits(gen(np.where(em_layers, 0.0, base), 0.0), had, a.limit)
+    em_part, had_true = dep(np.where(em_layers, base * g_em, 0.0), 0.0, a.had, n_had)
+    had_part, _ = dep(np.where(em_layers, 0.0, base), 0.0, a.had, n_had)
     left = had_true - em_part
     with np.errstate(divide='ignore', invalid='ignore'):
         r = had_part / left
@@ -75,8 +90,8 @@ def main():
                                                                                   time.time() - t))
 
     scaling = base * np.where(em_layers, g_em, g_had)
-    em_resp, _ = deposits(gen(scaling, a.cut), em, a.limit)
-    had_resp, _ = deposits(gen(scaling, a.cut), had, a.limit)
+    em_resp, _ = dep(scaling, a.cut, a.em, n_em)
+    had_resp, _ = dep(scaling, a.cut, a.had, n_had)
     for name, d, e in (("photons", em_resp, em_true), ("pions", had_resp, had_true)):
         q = d / e
         print("calibrated response %-8s mean %.3f, median %.3f, rms/mean %.3f" % (name, q.mean(), np.median(q),

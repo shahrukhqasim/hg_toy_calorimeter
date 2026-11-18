@@ -19,6 +19,7 @@ import os
 import shutil
 import socket
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,18 @@ def write_shard(path, records, groups, meta=None, per_record=()):
     if tmp.exists():
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
+    try:
+        _write_columns(tmp, records, groups, meta, per_record)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)            # no half-written shard is left behind
+        raise
+    if path.exists():
+        shutil.rmtree(path)
+    os.rename(tmp, path)
+    return path
+
+
+def _write_columns(tmp, records, groups, meta, per_record):
     n = len(records)
     keys = list(records[0].keys()) if n else []
     for r in records[1:]:
@@ -90,14 +103,11 @@ def write_shard(path, records, groups, meta=None, per_record=()):
                 written=time.strftime("%Y-%m-%dT%H:%M:%S"), host=socket.gethostname(), pid=os.getpid())
     info.update(meta or {})
     (tmp / "meta.json").write_text(json.dumps(info, indent=1, default=str))
-    if path.exists():
-        shutil.rmtree(path)
-    os.rename(tmp, path)
-    return path
 
 
 class Shard:
-    """One shard directory, memory-mapped on first use."""
+    """One shard directory, memory-mapped on first use. Every mapped column holds an open file, so a reader of many
+    shards must release() the ones it is not using (ShardSet keeps a bounded set open)."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -112,6 +122,9 @@ class Shard:
         if self._a is None:
             self._a = {p.stem: np.load(p, mmap_mode="r") for p in self.path.glob("*.npy")}
         return self._a
+
+    def release(self):
+        self._a = None
 
     def record(self, i):
         if not 0 <= i < self.n:
@@ -136,8 +149,11 @@ class ShardSet:
     """All shards under a folder (any depth), indexed as one sequence. Drop-in for the parts of
     ra_pickles.RandomAccessPicklesReader that create_dataset.py used (get_total, get_element, get_multi_in_parallel)."""
 
+    MAX_OPEN = 16          # shards mapped at once (each holds ~40 open files; the usual limit is 1024 per process)
+
     def __init__(self, folder, record_fn=None):
         self.folder = Path(folder)
+        self._open = OrderedDict()
         paths = sorted(p.parent for p in self.folder.rglob("meta.json") if not p.parent.name.endswith(".tmp"))
         self.shards = [Shard(p) for p in paths]
         self.shards = [s for s in self.shards if s.n > 0]
@@ -154,6 +170,12 @@ class ShardSet:
     def get_element(self, i):
         i = int(i)
         j = int(np.searchsorted(self.cum, i, side="right") - 1)
+        if j in self._open:
+            self._open.move_to_end(j)
+        else:
+            self._open[j] = True
+            while len(self._open) > self.MAX_OPEN:
+                self.shards[self._open.popitem(last=False)[0]].release()
         r = self.shards[j].record(i - int(self.cum[j]))
         return self.record_fn(r) if self.record_fn else r
 

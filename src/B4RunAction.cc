@@ -29,7 +29,6 @@
 /// \brief Implementation of the B4RunAction class
 
 #include "B4RunAction.hh"
-#include "B4Analysis.hh"
 
 #include "G4Run.hh"
 #include "G4RunManager.hh"

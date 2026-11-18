@@ -28,7 +28,7 @@ Cite as:
 The code builds against a current Geant4 (tested: 11.4.3) and Pythia 8.3 (tested: 8.318), with pybind11 from pip and
 jsoncpp from the submodule. ROOT and fastjet are no longer needed. Any environment with `geant4-config`,
 `pythia8-config`, CMake >= 3.16, a C++17 compiler and Python 3 works (tested in the `cudabear_blackwell_oct_2026_base`
-apptainer image, Python 3.14). The old `containers/` recipes (Geant4 10.7, Pythia 8.308) are kept for reference.
+apptainer image, Python 3.14).
 
 ```
 git clone https://github.com/shahrukhqasim/hg_toy_calorimeter.git
@@ -99,4 +99,23 @@ Writes event shards `<output_folder>/<NNNNN>/` (`hit_off.npy` and per-hit `recHi
 columns as before, `t_idx`, `t_energy`, `t_pos`, `t_time`, `t_pid`, `t_spectator`, `t_fully_contained`, `t_rec_energy`,
 `t_is_unique`) and `dataset_config.json`. `num_events_per_djc_file` is still accepted (alias `num_events_per_file`).
 
-`configuration/quick_test.ini` runs the whole chain in a few minutes.
+`configuration/quick_test.ini` runs the whole chain in a few minutes; `configuration/calibration_g4_11.ini` makes the
+calibration samples.
+
+### Tests
+```
+cd python && PYTHONPATH=libs python3 -m unittest discover -s test     # storage round trip, numpy only
+```
+
+## Repository layout
+```
+CMakeLists.txt, src/, include/   the Geant4 simulation (minicalo Python module)
+jsoncpp/                         submodule (detector description parsing)
+python/libs/calo/                detector generator, particle gun, event mixing, shard storage
+python/bin/                      run_simulations.py, calibrate.py, create_dataset.py, extract_sensor_data.py
+python/bin/configuration/        production.ini / datasets.ini (production settings), quick_test.ini,
+                                 calibration_g4_11.ini
+python/test/                     tests
+```
+The Geant4 10 example macros, ROOT scripts, old container recipes, the resolution/plotting scripts and the calibration
+notebook (all tied to ra_pickles / DeepJetCore / TensorFlow) were removed; they are in the history before this branch.

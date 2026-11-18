@@ -15,10 +15,6 @@ def to_2pi_m2pi(x):
 
 
 def angle_diff(x, y):
-    return np.arctan2(np.sin(x - y), np.cos(x - y))
-
-
-def angle_diff(x, y):
     """
     Returns symmetric difference in the range of [0,pi]
     """
@@ -26,15 +22,6 @@ def angle_diff(x, y):
     z = np.abs(z)
     return z
 
-
-
-def angle_diff_tf(x, y):
-    """
-    Returns symmetric difference in the range of [0,pi]
-    """
-    z = np.arctan2(np.sin(x - y), np.cos(x - y))   # numpy (was TensorFlow; same result)
-    z = np.abs(z)
-    return z
 
 
 def eta_phi_z_to_x_y_z(eta, phi, z):
@@ -65,11 +52,11 @@ def angle_between_vectors(v1, v2):
     return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0))
 
 
-def nxnAngles_tf(D1, D2):
+def nxnAngles(D1, D2):
     """
     Computes angles between every vector of D1 with every vector D2. Data axis is axis 1 (not axis 0).
     """
-    D1 = D1 / np.linalg.norm(D1, axis=1)[..., np.newaxis]   # numpy (was TensorFlow; same result)
+    D1 = D1 / np.linalg.norm(D1, axis=1)[..., np.newaxis]
     D2 = D2 / np.linalg.norm(D2, axis=1)[..., np.newaxis]
 
     x = np.sum(D1[np.newaxis, :, :] * D2[:, np.newaxis, :], axis=-1)

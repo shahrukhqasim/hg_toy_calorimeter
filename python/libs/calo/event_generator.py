@@ -407,7 +407,6 @@ class EventGenerator():
 
     def _merge_particles(self, simulation):
         t1 = time.time()
-        use_tf=False   # TensorFlow removed: the numpy branches below give the same result
 
         first_sensor_indices = simulation['particles_first_active_impact_sensor_idx']
         ex2 = np.array(simulation['particles_first_active_impact_position_x'])
@@ -422,38 +421,21 @@ class EventGenerator():
         # Convert them to eta,phi
         eeta, ephi, _ = dm.x_y_z_to_eta_phi_theta(ex, ey, ez)
 
-        if use_tf:
-            eeta, ephi = tf.convert_to_tensor(eeta), tf.convert_to_tensor(ephi)
-
         # sensors_eta, sensors_phi, _ = dm.x_y_z_to_eta_phi_theta(sensor_locations[:, 0],sensor_locations[:, 1],sensor_locations[:, 2])
 
-        if use_tf:
-            phi_distance = dm.angle_diff_tf(ephi[:, tf.newaxis], ephi[tf.newaxis, :])
-        else:
-            phi_distance = dm.angle_diff(ephi[:, np.newaxis], ephi[np.newaxis, :])
-
-        if use_tf:
-            eta_distance = tf.abs(eeta[:, np.newaxis] - eeta[np.newaxis, :])
-        else:
-            eta_distance = np.abs(eeta[:, np.newaxis] - eeta[np.newaxis, :])
+        phi_distance = dm.angle_diff(ephi[:, np.newaxis], ephi[np.newaxis, :])
+        eta_distance = np.abs(eeta[:, np.newaxis] - eeta[np.newaxis, :])
 
         # theta_distance = dm.angle_diff(dm.eta_to_theta(eeta[:, np.newaxis]), dm.eta_to_theta(eeta[np.newaxis, :]))
         # distance_matrix = np.sqrt(angle_distance**2 + eta_distance**2)
 
-        if use_tf:
-            picked_sensors_dphi = tf.maximum(self.all_sensors_dphi[first_sensor_indices][:, np.newaxis],
-                                             self.all_sensors_dphi[first_sensor_indices][np.newaxis, :])
-        else:
-            picked_sensors_dphi = np.maximum(self.all_sensors_dphi[first_sensor_indices][:, np.newaxis], self.all_sensors_dphi[first_sensor_indices][np.newaxis, :])
+        picked_sensors_dphi = np.maximum(self.all_sensors_dphi[first_sensor_indices][:, np.newaxis], self.all_sensors_dphi[first_sensor_indices][np.newaxis, :])
 
         close_in_phi =  phi_distance < picked_sensors_dphi * self.merging_dist_factor
 
         # picked_sensors_dtheta = np.maximum(self.all_sensors_dtheta[first_sensor_indices][:, np.newaxis], self.all_sensors_dtheta[first_sensor_indices][np.newaxis, :])
         # close_in_theta =  theta_distance < picked_sensors_dtheta * self.merging_dist_factor
-        if use_tf:
-            picked_sensors_deta = tf.maximum(self.all_sensors_deta[first_sensor_indices][:, np.newaxis], self.all_sensors_deta[first_sensor_indices][np.newaxis, :])
-        else:
-            picked_sensors_deta = np.maximum(self.all_sensors_deta[first_sensor_indices][:, np.newaxis], self.all_sensors_deta[first_sensor_indices][np.newaxis, :])
+        picked_sensors_deta = np.maximum(self.all_sensors_deta[first_sensor_indices][:, np.newaxis], self.all_sensors_deta[first_sensor_indices][np.newaxis, :])
 
         close_in_eta =  eta_distance < picked_sensors_deta * self.merging_dist_factor
 
@@ -463,7 +445,7 @@ class EventGenerator():
 
         momentum_vectors = np.concatenate((mx[..., np.newaxis], my[..., np.newaxis], mz[..., np.newaxis]), axis=-1)
 
-        angle_distances = dm.nxnAngles_tf(momentum_vectors, momentum_vectors)
+        angle_distances = dm.nxnAngles(momentum_vectors, momentum_vectors)
         limit = np.deg2rad(5.0)
         close_in_angle = angle_distances < limit
 
@@ -477,9 +459,6 @@ class EventGenerator():
             dont_have_tracks = np.logical_not(should_include_track(simulation['particles_pdgid']))
             dont_have_tracks_nxn = np.logical_and(dont_have_tracks[..., np.newaxis], dont_have_tracks[np.newaxis, ...])
             connection_adjacency_matrix = np.logical_and(connection_adjacency_matrix, dont_have_tracks_nxn)
-
-        if use_tf:
-            connection_adjacency_matrix = connection_adjacency_matrix.numpy()
 
         num_showers_after_merging, labels = connected_components(connection_adjacency_matrix, directed=False)
 
@@ -516,11 +495,6 @@ class EventGenerator():
             hits_particle_id = simulation['hit_particle_id'].astype(np.int64)
             hits_particle_deposit = simulation['hit_particle_deposit']
             hits_particle_sensor_idx = simulation['hit_particle_sensor_idx']
-
-            if use_tf:
-                hits_particle_id = tf.convert_to_tensor(hits_particle_id)
-                hits_particle_deposit = tf.convert_to_tensor(hits_particle_deposit)
-                hits_particle_sensor_idx = tf.convert_to_tensor(hits_particle_sensor_idx)
 
             hits_particle_id = np.asarray(labels)[hits_particle_id]
             hits_particle_id, hits_particle_sensor_idx, hits_particle_deposit = merge_hits(hits_particle_id, np.asarray(hits_particle_sensor_idx), np.asarray(hits_particle_deposit))

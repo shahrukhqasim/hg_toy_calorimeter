@@ -35,7 +35,6 @@
 #include "G4VisExecutive.hh"
 #include "G4UIExecutive.hh"
 #include "G4RandomTools.hh"
-#include "B4DetectorConstructionFP.hh"
 
 //limiter stuff
 

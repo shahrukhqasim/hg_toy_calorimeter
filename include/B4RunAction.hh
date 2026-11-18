@@ -53,7 +53,7 @@ class B4aEventAction;
 /// - Track length in gap
 /// The same values are also saved in the ntuple.
 /// The histograms and ntuple are saved in the output file in a format
-/// accoring to a selected technology in B4Analysis.hh.
+///
 ///
 /// In EndOfRunAction(), the accumulated statistic and computed 
 /// dispersion is printed.
