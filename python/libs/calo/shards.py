@@ -2,8 +2,8 @@
 
 The layout follows the fcc-ai-design shards (lyra/data/pf/<shard>/<array>.npy): a shard is one directory holding one
 .npy file per column, plus offset arrays that cut the concatenated columns into records (simulations or events), and a
-meta.json. Readers memory-map the columns, so a record is read without loading the shard, and the files are plain
-numpy: no pickles, no container needed to read them.
+meta.json. Readers read only a record's rows from each column and close the files again (np.load(..., mmap_mode="r")
+works too for interactive use); the files are plain numpy: no pickles, no container needed to read them.
 
   <shard>/meta.json            n records, the groups and their offset arrays, writer info and any user metadata
   <shard>/<group>_off.npy      int64 [n + 1] offsets of each variable-length group (e.g. hit_off for the hit_* columns)
@@ -19,7 +19,6 @@ import os
 import shutil
 import socket
 import time
-from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -94,7 +93,12 @@ def _write_columns(tmp, records, groups, meta, per_record):
             elif not np.array_equal(lens, l_):
                 bad = int(np.flatnonzero(lens != l_)[0])
                 raise ValueError(f"column {k!r} of group {g!r} has another length than the group in record {bad}")
-            np.save(tmp / f"{k}.npy", np.concatenate(arrs) if len(arrs) else np.zeros(0), allow_pickle=False)
+            # minicalo returns an empty per-particle list as float64: take the dtype from the non-empty records so one
+            # empty record does not turn an integer column (indices, ids) into floats
+            full = [x for x in arrs if x.size]
+            dt = np.result_type(*full) if full else (arrs[0].dtype if arrs else np.float64)
+            np.save(tmp / f"{k}.npy", np.concatenate([x.astype(dt, copy=False) for x in arrs]) if arrs else np.zeros(0, dt),
+                    allow_pickle=False)
         np.save(tmp / f"{g}_off.npy", np.concatenate([[0], np.cumsum(lens)]).astype(np.int64), allow_pickle=False)
         group_meta[g] = dict(offsets=f"{g}_off", columns=sorted(cols))
     for k, v in fixed_cols.items():
@@ -105,9 +109,34 @@ def _write_columns(tmp, records, groups, meta, per_record):
     (tmp / "meta.json").write_text(json.dumps(info, indent=1, default=str))
 
 
+class _Column:
+    """One .npy column: the header is parsed once, then each read opens the file, reads the rows asked for and closes
+    it again, so no file stays open however many shards a reader touches."""
+
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as f:
+            version = np.lib.format.read_magic(f)
+            read = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+            shape, fortran, dtype = read(f)
+            self.offset = f.tell()
+        if fortran:
+            raise ValueError(f"{path}: Fortran-ordered arrays are not supported")
+        self.shape, self.dtype = shape, dtype
+        self.row = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+
+    def rows(self, s, e):
+        n = max(0, e - s)
+        with open(self.path, "rb") as f:
+            f.seek(self.offset + s * self.row * self.dtype.itemsize)
+            a = np.fromfile(f, dtype=self.dtype, count=n * self.row)
+        if len(a) != n * self.row:
+            raise OSError(f"{self.path}: short read")
+        return a.reshape((n,) + tuple(self.shape[1:]))
+
+
 class Shard:
-    """One shard directory, memory-mapped on first use. Every mapped column holds an open file, so a reader of many
-    shards must release() the ones it is not using (ShardSet keeps a bounded set open)."""
+    """One shard directory. Columns are read on demand (no memory maps, no files left open)."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -115,30 +144,35 @@ class Shard:
         if self.meta.get("format") != FORMAT:
             raise ValueError(f"{self.path}: not a {FORMAT} shard")
         self.n = int(self.meta["n"])
-        self._a = None
+        self._cols = None
+        self._off = {}
 
-    @property
-    def a(self):
-        if self._a is None:
-            self._a = {p.stem: np.load(p, mmap_mode="r") for p in self.path.glob("*.npy")}
-        return self._a
+    def _col(self, k):
+        if self._cols is None:
+            self._cols = {}
+        if k not in self._cols:
+            self._cols[k] = _Column(self.path / f"{k}.npy")
+        return self._cols[k]
 
-    def release(self):
-        self._a = None
+    def array(self, k):
+        """A whole column (e.g. an offset array, or a per-record column)."""
+        c = self._col(k)
+        return c.rows(0, c.shape[0] if c.shape else 1)
 
     def record(self, i):
         if not 0 <= i < self.n:
             raise IndexError(i)
-        a = self.a
         out = dict(self.meta["constants"])
         for g, gm in self.meta["groups"].items():
-            off = a[gm["offsets"]]
+            if g not in self._off:                      # offsets are small: kept in memory
+                self._off[g] = self.array(gm["offsets"])
+            off = self._off[g]
             s, e = int(off[i]), int(off[i + 1])
             for k in gm["columns"]:
-                out[k] = np.array(a[k][s:e])
+                out[k] = self._col(k).rows(s, e)
         for k in self.meta["per_record"]:
-            v = np.array(a[k][i])
-            out[k] = v.item() if v.ndim == 0 else v
+            v = self._col(k).rows(i, i + 1)[0]
+            out[k] = v.item() if np.ndim(v) == 0 else v
         return out
 
     def __len__(self):
@@ -149,11 +183,8 @@ class ShardSet:
     """All shards under a folder (any depth), indexed as one sequence. Drop-in for the parts of
     ra_pickles.RandomAccessPicklesReader that create_dataset.py used (get_total, get_element, get_multi_in_parallel)."""
 
-    MAX_OPEN = 16          # shards mapped at once (each holds ~40 open files; the usual limit is 1024 per process)
-
     def __init__(self, folder, record_fn=None):
         self.folder = Path(folder)
-        self._open = OrderedDict()
         paths = sorted(p.parent for p in self.folder.rglob("meta.json") if not p.parent.name.endswith(".tmp"))
         self.shards = [Shard(p) for p in paths]
         self.shards = [s for s in self.shards if s.n > 0]
@@ -170,17 +201,11 @@ class ShardSet:
     def get_element(self, i):
         i = int(i)
         j = int(np.searchsorted(self.cum, i, side="right") - 1)
-        if j in self._open:
-            self._open.move_to_end(j)
-        else:
-            self._open[j] = True
-            while len(self._open) > self.MAX_OPEN:
-                self.shards[self._open.popitem(last=False)[0]].release()
         r = self.shards[j].record(i - int(self.cum[j]))
         return self.record_fn(r) if self.record_fn else r
 
     def get_multi_in_parallel(self, indices, timeout=None):
-        # memory-mapped reads are fast enough sequentially; the signature matches ra_pickles
+        # direct reads are fast enough sequentially; the signature matches ra_pickles
         return [self.get_element(i) for i in indices]
 
 

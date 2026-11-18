@@ -61,22 +61,39 @@ class ShardTest(unittest.TestCase):
                     self.assertTrue(np.array_equal(r[k], e[k]), k)
                     self.assertEqual(r[k].dtype, e[k].dtype)
 
-    def test_many_shards_bounded_open_files(self):
+    def test_many_shards_no_open_files(self):
+        """Two libraries of 60 shards read in random order under a 64-file limit (pileup mixing reads particles and
+        pileup together: memory-mapped columns ran into the open-files limit)."""
         import resource
         rng = np.random.default_rng(3)
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         with tempfile.TemporaryDirectory() as d:
-            sims = [fake_sim(rng, 4, 6, 2) for _ in range(120)]
-            for k in range(60):
-                write_sim_shard(Path(d) / f"s{k:03d}", [sim_record(s, g) for s, g in sims[2 * k:2 * k + 2]])
-            lib = sim_library(d)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (min(256, hard), hard))   # 60 shards x 13 columns > 256
+            libs, sims = [], []
+            for name in ("parts", "pu"):
+                ss = [fake_sim(rng, 4, 6, 2) for _ in range(120)]
+                for k in range(60):
+                    write_sim_shard(Path(d) / name / f"s{k:03d}", [sim_record(s, g) for s, g in ss[2 * k:2 * k + 2]])
+                libs.append(sim_library(Path(d) / name))
+                sims.append(ss)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, hard), hard))
             try:
-                for i in rng.permutation(lib.get_total()):
-                    s2, _ = lib.get_element(i)
-                    self.assertTrue(np.array_equal(s2["rechit_energy"], sims[i][0]["rechit_energy"]))
+                for i in rng.permutation(120):
+                    for lib, ss in zip(libs, sims):
+                        s2, _ = lib.get_element(i)
+                        self.assertTrue(np.array_equal(s2["rechit_energy"], ss[i][0]["rechit_energy"]))
+                        self.assertTrue(np.array_equal(s2["particles_pdgid"], ss[i][0]["particles_pdgid"]))
             finally:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    def test_empty_record_keeps_integer_dtype(self):
+        rng = np.random.default_rng(4)
+        with tempfile.TemporaryDirectory() as d:
+            a, _ = fake_sim(rng, 3, 4, 2, gun=False)
+            b = dict(a, particles_pdgid=np.array([]), particles_kinetic_energy=np.array([]))   # what minicalo returns
+            a["particles_pdgid"] = a["particles_pdgid"].astype(np.int32)
+            write_sim_shard(Path(d) / "s", [sim_record(b), sim_record(a)])
+            r = sim_library(d).get_element(1)
+            self.assertEqual(r["particles_pdgid"].dtype, np.int32)
 
     def test_rejects_ragged_group(self):
         with tempfile.TemporaryDirectory() as d:

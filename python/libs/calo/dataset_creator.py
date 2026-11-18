@@ -6,6 +6,7 @@ Event shard <output>/<NNNNN>/: hit_off.npy (int64 [n_events + 1]) and per hit
                                     columns, in the same order, as the recHitFeatures array of the .djctd files)
   t_idx int32, t_energy, t_pos [N, 3], t_time, t_pid, t_spectator, t_fully_contained, t_rec_energy (float32),
   t_is_unique int32                 the truth arrays of the .djctd files, 1-D instead of [N, 1]
+  t_only_minbias int32              1 if the hit's particle comes from a pileup (minimum-bias) collision
 plus meta.json (the column lists and the dataset configuration).
 """
 import json
@@ -25,7 +26,7 @@ FEATURE_COLUMNS = ['recHitEnergy', 'recHitEta', 'recHitIsTrack', 'recHitTheta', 
                    'recHitZ', 'recHitTime', 'recHitHitR']
 TRUTH_DTYPES = dict(t_idx=np.int32, t_energy=np.float32, t_pos=np.float32, t_time=np.float32, t_pid=np.float32,
                     t_spectator=np.float32, t_fully_contained=np.float32, t_rec_energy=np.float32,
-                    t_is_unique=np.int32)
+                    t_is_unique=np.int32, t_only_minbias=np.int32)
 
 
 def find_pcas(x_to_fit, PCA_n=2, min_hits=10):
@@ -43,7 +44,20 @@ def find_pcas(x_to_fit, PCA_n=2, min_hits=10):
     return np.round(np.sqrt(np.maximum(np.einsum('ij,jk,ik->i', d, vi, d), 0)), 1)
 
 
-def event_making_process(
+ERROR = '__event_making_error__'
+
+
+def event_making_process(q_in, q_out, *args, **kwargs):
+    """Runs _event_making_process; a crash is sent to the parent (which stops the run) instead of dying silently."""
+    try:
+        _event_making_process(q_in, q_out, *args, **kwargs)
+    except BaseException:
+        import traceback
+        q_out.put((ERROR, traceback.format_exc()))
+        raise
+
+
+def _event_making_process(
         q_in, q_out, sensor_data,
         rechit_cut, min_hits_cut=3,
         pu_phase_cut=None, pu_eta_cut=None,
@@ -211,6 +225,9 @@ class DatasetCreator():
                  alter_muon_truth=False,
                  meta=None):
         self.meta = dict(meta or {})
+        self.loading_error = None
+        self.worker_error = None
+        self.stop = False
         self.output_path = output_path
         self.rechit_cut = rechit_cut
         self.sensor_data = sensor_data
@@ -248,11 +265,12 @@ class DatasetCreator():
 
     def data_loading_thread(self):
         n_loaded = 0
-        while n_loaded < self.num_events_total:
+        failures = 0
+        while n_loaded < self.num_events_total and not self.stop:
             # Don't load too much and hog the memory -- wait if too much writing or event creation is in process
             # TODO: This is a possible memory leak if writing is the bottleneck. For now its okay.
             # (writing is a not a bottleneck for now)
-            while (self.events_input_cache.qsize()) > 30:
+            while (self.events_input_cache.qsize()) > 30 and not self.stop:
                 time.sleep(0.05)
 
             num_part = self.num_particles_per_event()
@@ -274,8 +292,13 @@ class DatasetCreator():
             try:
                 particles = self.load_n(self.particles_iterator, load_particle_samples)
                 pu = self.load_n(self.pu_iterator, load_pu_samples)
-            except OSError:
-                print("Error -- handled?")
+                failures = 0
+            except OSError as e:
+                failures += 1
+                print("Reading simulations failed (%d in a row): %r" % (failures, e), flush=True)
+                if failures >= 10:                  # a persistent error must stop the run, not loop forever
+                    self.loading_error = e
+                    break
                 continue
 
             if len(particles) != num_part or len(pu) != num_pu:
@@ -354,6 +377,11 @@ class DatasetCreator():
                 if data is None:
                     self.write_out(data_queue)
                     break
+                if isinstance(data[0], str) and data[0] == ERROR:
+                    print("An event-making process failed:\n" + data[1], flush=True)
+                    self.worker_error = data[1]
+                    self.stop = True
+                    continue
                 data_queue.put(data)
                 if data_queue.qsize() >= self.num_events_per_djc_file:
                     self.write_out(data_queue)
@@ -410,4 +438,8 @@ class DatasetCreator():
 
         self.loading_thread.join()
         self.writing_thread.join()
+        if self.loading_error is not None:
+            raise RuntimeError("stopped: reading the simulations kept failing") from self.loading_error
+        if self.worker_error is not None:
+            raise RuntimeError("stopped: an event-making process failed:\n" + self.worker_error)
 

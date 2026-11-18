@@ -408,7 +408,7 @@ class EventGenerator():
     def _merge_particles(self, simulation):
         t1 = time.time()
 
-        first_sensor_indices = simulation['particles_first_active_impact_sensor_idx']
+        first_sensor_indices = np.asarray(simulation['particles_first_active_impact_sensor_idx']).astype(np.int64)
         ex2 = np.array(simulation['particles_first_active_impact_position_x'])
         ey2 = np.array(simulation['particles_first_active_impact_position_y'])
         ez2 = np.array(simulation['particles_first_active_impact_position_z'])
