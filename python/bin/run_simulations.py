@@ -1,197 +1,176 @@
+"""Generate a library of Geant4 simulations (single particles, minimum bias or qqbar -> ttbar) on many CPU cores.
+
+  python3 run_simulations.py <config.ini> <section>
+  python3 run_simulations.py minbias <output_path> [--cores 10] [--num-simulations N] [--num-simulations-per-file M]
+
+Output: <output_path>/<simtype>_<seed>_<chunk>/ shard directories (calo/shards.py: one .npy per column, offsets per
+group, meta.json), each holding num-simulations-per-file simulations, plus <output_path>/detector_spec.json and
+<output_path>/sensor_data.npz (minicalo.get_sensor_data(): position, size, layer of every sensor). A shard
+is renamed into place only when complete, so an interrupted run leaves no partial shards (only *.tmp directories).
+Single-particle shards also hold the generated gun particle (gun_* columns).
+
+num-simulations is per core (as before): the run writes cores x num-simulations simulations.
+"""
+import argparse
 import configparser
 import json
 import multiprocessing
 import os
+import subprocess
 import sys
-
-import numpy as np
-import argh
 import time
 
-import ra_pickles
+import numpy as np
+
+from calo.config import ensure_tls, pythia_data
 from calo.particle_generator import ParticleGenerator
 from calo.calo_generator import CaloV3Generator, CaloV4Generator
-from calo.config import set_env, is_laptop
+from calo.shards import sim_record, write_sim_shard
 
-set_env()
+ALLOWED = {'minbias', 'qqbar2ttbar', 'singlepart', 'singlepart_face'}
 
 
-def work(simtype, output_path, num_events, num_events_per_file, conf):
-    # %%
+def _versions():
+    out = {}
+    for k, cmd in (("geant4", ["geant4-config", "--version"]), ("pythia8", ["pythia8-config", "--version"])):
+        try:
+            out[k] = subprocess.check_output(cmd, text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            out[k] = None
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out["git_commit"] = subprocess.check_output(["git", "-C", here, "rev-parse", "HEAD"], text=True,
+                                                    stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        out["git_commit"] = None
+    return out
+
+
+def detector_specs_for(conf):
+    def f(k):
+        return float(conf[k]) if k in conf else None
+    calo_type = conf.get('calo', 'v3')
+    CGenerator = {'v3': CaloV3Generator, 'v4': CaloV4Generator}.get(calo_type)
+    if CGenerator is None:
+        raise NotImplementedError('calo must be v3 or v4, not %s' % calo_type)
+    gen = CGenerator(calo_min_kinetic_energy=f('calo_min_kinetic_energy'),
+                     world_min_kinetic_energy=f('world_min_kinetic_energy'),
+                     calo_max_time=f('calo_max_time'), world_max_time=f('world_max_time'),
+                     sensor_thickness=f('sensor_thickness'))
+    return calo_type, gen.generate()
+
+
+def work(worker, simtype, output_path, num_events, num_events_per_file, conf, versions):
     import minicalo
-    set_env()
 
     np.random.seed()
-    rnd = np.random.randint(0, 1000000000)
-    rnd2 = np.random.randint(0, 1000000000)
-    rnd3 = np.random.randint(0, 1000000000)
-    rnd4 = np.random.randint(0, 1000000000)
-    print("Seed is",rnd)
+    seeds = [int(x) for x in np.random.randint(0, 1000000000, size=4)]
+    print("Worker", worker, "seeds", seeds, flush=True)
 
-    calo_min_kinetic_energy = None
-    world_min_kinetic_energy = None
-    calo_max_time = None
-    world_max_time = None
-    sensor_thickness = None
+    calo_type, detector_specs = detector_specs_for(conf)
+    minicalo.initialize(json.dumps(detector_specs), pythia_data(conf), False, *seeds)  # third: collect_full_data
+    sensor_file = os.path.join(output_path, 'sensor_data.npz')
+    if worker == 0 and not os.path.exists(sensor_file):     # the sensor table (calibrate.py starts from it)
+        sd = {k: np.asarray(v) for k, v in minicalo.get_sensor_data().items()}
+        np.savez(sensor_file + '.tmp.npz', **sd)
+        os.replace(sensor_file + '.tmp.npz', sensor_file)
 
-    if 'calo_min_kinetic_energy' in conf:
-        calo_min_kinetic_energy = float(conf['calo_min_kinetic_energy'])
-    if 'world_min_kinetic_energy' in conf:
-        world_min_kinetic_energy = float(conf['world_min_kinetic_energy'])
-    if 'calo_max_time' in conf:
-        calo_max_time = float(conf['calo_max_time'])
-    if 'world_max_time' in conf:
-        world_max_time = float(conf['world_max_time'])
-    if 'sensor_thickness' in conf:
-        sensor_thickness = float(conf['sensor_thickness'])
-
-    CGenerator = CaloV3Generator
-    if 'calo' in conf:
-        calo_type = conf['calo']
-
-        if calo_type=='v3':
-            CGenerator = CaloV3Generator
-        elif calo_type == 'v4':
-            CGenerator = CaloV4Generator
-        else:
-            raise NotImplementedError('Error')
-
-    calo_generator = CGenerator(calo_min_kinetic_energy=calo_min_kinetic_energy,
-                                     world_min_kinetic_energy=world_min_kinetic_energy,
-                                     calo_max_time=calo_max_time,
-                                     world_max_time=world_max_time, sensor_thickness=sensor_thickness)
-
-    detector_specs = calo_generator.generate()
-
-    nsen = 0
-    for layer_upper in detector_specs['layers']:
-        for layer in layer_upper:
-            for eta_segment in layer['eta_segments']:
-                nsen += int(eta_segment['phi_segments'])
-
-    minicalo.initialize(json.dumps(detector_specs), '/afs/cern.ch/work/s/sqasim/workspace_phd_5/NextCal/pythia8306/share/Pythia8'
-                        if not is_laptop else '/Users/shahrukhqasim/Workspace/NextCal/miniCalo/pythia8-data',
-                        False, rnd, rnd2, rnd3, rnd4) # third argument is collect_full_data
-
-    # particle_pdgid = [11, 22, 211, 111, 15]
     if 'pdgid' in conf:
-        particle_pdgid=[int(x) for x in str(conf['pdgid']).split(',')]
+        particle_pdgid = [int(x) for x in str(conf['pdgid']).split(',')]
     else:
         particle_pdgid = [11, 22, 211, 111]
         if simtype == 'singlepart':
             particle_pdgid += [15]
-
-    range_energy = [0.1, 200]
-    if 'energy_min' in conf:
-        range_energy = [float(conf['energy_min']), float(conf['energy_max'])]
-
-    range_eta = [3.1, 1.4]
-    if 'eta_min' in conf:
-        range_eta = [float(conf['eta_min']), float(conf['eta_max'])]
-
-    particle_generator = ParticleGenerator(detector_specs, range_energy=range_energy, particle_pdgid=particle_pdgid, range_eta=range_eta)
-
-    if 'filter_deposited' in conf:
-        filter_deposited = conf['filter_deposited'] == 'True' or conf['filter_deposited'] == 'true' or conf['filter_deposited'] == '1'
-    else:
-        filter_deposited=False
+    range_energy = [float(conf['energy_min']), float(conf['energy_max'])] if 'energy_min' in conf else [0.1, 200]
+    range_eta = [float(conf['eta_min']), float(conf['eta_max'])] if 'eta_min' in conf else [3.1, 1.4]
+    particle_generator = ParticleGenerator(detector_specs, range_energy=range_energy, particle_pdgid=particle_pdgid,
+                                           range_eta=range_eta)
+    filter_deposited = str(conf.get('filter_deposited', 'False')).lower() in ('true', '1', 'yes', 'on')
 
     num_events_written = 0
-    while True:
-        if num_events_written==num_events:
-            break
-        simulation_results_array = []
-        j = 0
-        while True:
+    chunk = 0
+    while num_events_written < num_events:
+        n_file = min(num_events_per_file, num_events - num_events_written)
+        records = []
+        t0 = time.time()
+        while len(records) < n_file:
             if simtype in {'singlepart', 'singlepart_face'}:
-                particle = particle_generator.generate(from_iteraction_point=simtype=='singlepart')
-                simulation_result = minicalo.simulate_particle(
-                    float(particle['position'][0]),
-                    float(particle['position'][1]),
-                    float(particle['position'][2]),
-                    float(particle['direction'][0]),
-                    float(particle['direction'][1]),
-                    float(particle['direction'][2]),
-                    int(particle['pdgid']),
-                    float(particle['energy']),
-                )
-                simulation_result['simulator'] = calo_type
+                particle = particle_generator.generate(from_iteraction_point=simtype == 'singlepart')
+                result = minicalo.simulate_particle(
+                    *[float(v) for v in particle['position']], *[float(v) for v in particle['direction']],
+                    int(particle['pdgid']), float(particle['energy']))
+                result['simulator'] = calo_type
                 if filter_deposited:
-                    rechit_sum = np.sum(simulation_result['rechit_energy'])
-                    print("Rechit sum", rechit_sum)
+                    rechit_sum = np.sum(result['rechit_energy'])
                     if rechit_sum < 0.001:
                         continue
-                simulation_results_array.append((simulation_result, particle))
-
-            elif simtype=='minbias':
-                simulation_result = minicalo.simulate_pu()
-                simulation_results_array.append(simulation_result)
-            elif simtype=='qqbar2ttbar':
-                simulation_result = minicalo.simulate_qqbar2ttbar()
-                simulation_results_array.append(simulation_result)
-            j += 1
-
-            if j==num_events_per_file:
-                break
-
-        print("Put in", output_path)
-        dataset = ra_pickles.RandomAccessPicklesWriter(len(simulation_results_array), output_path)
-        for x in simulation_results_array:
-            dataset.add(x)
-            num_events_written += 1
-        dataset.close()
-
+                records.append(sim_record(result, particle))
+            elif simtype == 'minbias':
+                records.append(sim_record(minicalo.simulate_pu()))
+            elif simtype == 'qqbar2ttbar':
+                records.append(sim_record(minicalo.simulate_qqbar2ttbar()))
+        name = "%s_%09d_%05d" % (simtype, seeds[0], chunk)
+        meta = dict(kind="simulations", simtype=simtype, calo=calo_type, seeds=seeds, worker=worker, chunk=chunk,
+                    config=dict(conf), seconds=round(time.time() - t0, 1), **versions)
+        p = write_sim_shard(os.path.join(output_path, name), records, meta=meta)
+        num_events_written += len(records)
+        chunk += 1
+        print("Wrote", p, len(records), "simulations in", round(time.time() - t0, 1), "s", flush=True)
 
 
 def main(simtype, output_path, cores=10, num_simulations=1000000, num_simulations_per_file=100, conf=None):
     """
-    Generate a large set of simulations using multiple CPU/CPU cores.
+    Generate a large set of simulations using multiple CPU cores.
 
-    :param simtype: Type of the simulation. Can be either of the following:
-                    1. minbias -- 14 TeV proton-proton interactions
+    :param simtype: 1. minbias -- 14 TeV proton-proton interactions
                     2. qqbar2ttbar -- qqbar to ttbar interaction
-                    3. singlepart -- generate single particles at the interaction point with 1.4 |eta| < 3.1
-                    4. singlepart_face -- generate single particles with 1.4 |eta| < 3.1, 1 cm away from the calorimeter
-    :param output-path: A folder where to store the simulations, will be created if it does not exist.
-    :param cores: Number of CPU cores
-    :param num-simulations: Number of events to generate per CPU core
-    :param num-simulations-per-file: Number of events to generate per file per CPU core (just a storage spec)
+                    3. singlepart -- single particles from the interaction point with 1.4 < |eta| < 3.1
+                    4. singlepart_face -- single particles with 1.4 < |eta| < 3.1, 1 cm away from the calorimeter
+    :param output_path: folder for the simulation shards, created if it does not exist
+    :param cores: number of worker processes
+    :param num_simulations: simulations per worker
+    :param num_simulations_per_file: simulations per shard
     """
+    conf = dict(conf or {})
+    if simtype not in ALLOWED:
+        raise ValueError('Wrong simtype %s: select from %s' % (simtype, sorted(ALLOWED)))
+    os.makedirs(output_path, exist_ok=True)
+    _, spec = detector_specs_for(conf)
+    with open(os.path.join(output_path, 'detector_spec.json'), 'w') as f:
+        json.dump(spec, f)
+    versions = _versions()
+    print("Going to do", simtype, 'on', cores, 'cores;', versions, flush=True)
 
-    os.system('mkdir -p %s'%output_path)
-
-    allowed_sim_types = {'minbias', 'qqbar2ttbar', 'singlepart', 'singlepart_face'}
-    if not simtype in allowed_sim_types:
-        raise ValueError('Wrong simtype %s: select from '%simtype, allowed_sim_types)
-
-    print("Going to do", simtype, 'and cores', cores)
-
+    ctx = multiprocessing.get_context('fork')   # Python 3.14 defaults to forkserver on Linux
     processes = []
     for m in range(cores):
-        print("Starting")
-        p = multiprocessing.Process(target=work, args=(simtype,output_path, num_simulations, num_simulations_per_file, conf))
+        p = ctx.Process(target=work, args=(m, simtype, output_path, num_simulations, num_simulations_per_file, conf,
+                                           versions))
         p.start()
         time.sleep(0.3)
         processes.append(p)
-
     for p in processes:
         p.join()
+    failed = [i for i, p in enumerate(processes) if p.exitcode != 0]
+    if failed:
+        raise SystemExit("workers %s failed (exit codes %s)" % (failed, [processes[i].exitcode for i in failed]))
 
-if __name__=='__main__':
-    is_config_file = np.any(['.ini' in x for x in sys.argv])
-    if is_config_file:
-        config_file = sys.argv[1]
-        section = sys.argv[2]
+
+if __name__ == '__main__':
+    ensure_tls()
+    if any(x.endswith('.ini') for x in sys.argv[1:2]):
         config = configparser.ConfigParser()
-        config.read(config_file)
-
-        simtype=config[section]['simtype']
-        outpath=config[section]['outpath']
-        cores=config[section]['cores']
-        num_simulations = config[section]['num-simulations']
-        num_simulations_per_file = config[section]['num-simulations-per-file']
-
-        main(simtype, outpath, int(cores), int(num_simulations), int(num_simulations_per_file), config[section])
+        config.read(sys.argv[1])
+        sec = config[sys.argv[2]]
+        main(sec['simtype'], sec['outpath'], int(sec['cores']), int(sec['num-simulations']),
+             int(sec['num-simulations-per-file']), sec)
     else:
-        argh.dispatch_command(main)
-
+        ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        ap.add_argument('simtype', choices=sorted(ALLOWED))
+        ap.add_argument('output_path')
+        ap.add_argument('--cores', type=int, default=10)
+        ap.add_argument('--num-simulations', type=int, default=1000000)
+        ap.add_argument('--num-simulations-per-file', type=int, default=100)
+        ap.add_argument('--calo', default='v3', choices=['v3', 'v4'])
+        a = ap.parse_args()
+        main(a.simtype, a.output_path, a.cores, a.num_simulations, a.num_simulations_per_file, {'calo': a.calo})

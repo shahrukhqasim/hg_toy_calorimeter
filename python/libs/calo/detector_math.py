@@ -1,5 +1,4 @@
 import numpy as np
-import tensorflow as tf
 
 
 def x_y_z_to_eta_phi_theta(x, y, z):
@@ -33,8 +32,8 @@ def angle_diff_tf(x, y):
     """
     Returns symmetric difference in the range of [0,pi]
     """
-    z = tf.math.atan2(tf.math.sin(x - y), tf.math.cos(x - y))
-    z = tf.abs(z)
+    z = np.arctan2(np.sin(x - y), np.cos(x - y))   # numpy (was TensorFlow; same result)
+    z = np.abs(z)
     return z
 
 
@@ -70,11 +69,11 @@ def nxnAngles_tf(D1, D2):
     """
     Computes angles between every vector of D1 with every vector D2. Data axis is axis 1 (not axis 0).
     """
-    D1 = D1 / tf.linalg.norm(D1, axis=1)[..., tf.newaxis]
-    D2 = D2 / tf.linalg.norm(D2, axis=1)[..., tf.newaxis]
+    D1 = D1 / np.linalg.norm(D1, axis=1)[..., np.newaxis]   # numpy (was TensorFlow; same result)
+    D2 = D2 / np.linalg.norm(D2, axis=1)[..., np.newaxis]
 
-    x = tf.reduce_sum(D1[tf.newaxis, :, :] * D2[:, tf.newaxis, :], axis=-1)
-    x = tf.clip_by_value(x, -1.0, +1.0)
-    x = tf.acos(x)
+    x = np.sum(D1[np.newaxis, :, :] * D2[:, np.newaxis, :], axis=-1)
+    x = np.clip(x, -1.0, +1.0)
+    x = np.arccos(x)
 
     return x

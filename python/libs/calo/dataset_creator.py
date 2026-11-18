@@ -1,45 +1,46 @@
-import gzip
-import io
+"""Events from simulation libraries: mixes particle (and pileup) simulations into events and writes them as columnar
+event shards (calo/shards.py) instead of DeepJetCore .djctd files.
+
+Event shard <output>/<NNNNN>/: hit_off.npy (int64 [n_events + 1]) and per hit
+  recHitFeatures   float32 [N, 10]  energy, eta, is_track, theta, r, x, y, z, time, hit_r  (FEATURE_COLUMNS; the same
+                                    columns, in the same order, as the recHitFeatures array of the .djctd files)
+  t_idx int32, t_energy, t_pos [N, 3], t_time, t_pid, t_spectator, t_fully_contained, t_rec_energy (float32),
+  t_is_unique int32                 the truth arrays of the .djctd files, 1-D instead of [N, 1]
+plus meta.json (the column lists and the dataset configuration).
+"""
+import json
 import os
-import pickle
 import threading
 import time
-import uuid
 import queue
 
 import numpy as np
 import multiprocessing
 
-from ra_pickles import RandomAccessPicklesWriter
 from calo.detector_math import x_y_z_to_eta_phi_theta
-from calo.config import is_laptop
 from calo.event_generator import EventGenerator
+from calo.shards import write_event_shard
 
-if not is_laptop:
-    from datastructures.TrainData_NanoML import TrainData_NanoML, find_pcas
-    from DeepJetCore import SimpleArray
-
-def unprocess(data):
-    binary_data = io.BytesIO(data)
-    gzipfile = gzip.GzipFile(fileobj=binary_data, mode='rb')
-    data_loaded = pickle.load(gzipfile)
-    gzipfile.close()
-    return data_loaded
+FEATURE_COLUMNS = ['recHitEnergy', 'recHitEta', 'recHitIsTrack', 'recHitTheta', 'recHitR', 'recHitX', 'recHitY',
+                   'recHitZ', 'recHitTime', 'recHitHitR']
+TRUTH_DTYPES = dict(t_idx=np.int32, t_energy=np.float32, t_pos=np.float32, t_time=np.float32, t_pid=np.float32,
+                    t_spectator=np.float32, t_fully_contained=np.float32, t_rec_energy=np.float32,
+                    t_is_unique=np.int32)
 
 
-def grow():
-    import tensorflow as tf
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            # Currently, memory growth needs to be the same across GPUs
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            logical_gpus = tf.config.list_logical_devices('GPU')
-            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-        except RuntimeError as e:
-            # Memory growth must be set before GPUs have been initialized
-            print(e)
+def find_pcas(x_to_fit, PCA_n=2, min_hits=10):
+    """Mahalanobis distance of each hit from the shower centre in its first PCA_n principal components (after
+    standardising x, y, z), rounded to 0.1: HGCalML's TrainData_NanoML.find_pcas (sklearn + scipy) in numpy."""
+    if x_to_fit.shape[0] < min_hits:
+        return None
+    x = np.asarray(x_to_fit, np.float64)
+    sd = x.std(axis=0)
+    x = (x - x.mean(axis=0)) / np.where(sd > 0, sd, 1.0)        # StandardScaler (a constant column stays 0)
+    _, _, vt = np.linalg.svd(x, full_matrices=False)          # PCA: centred data projected on the leading components
+    t = x @ vt[:PCA_n].T
+    d = t - t.mean(axis=0)
+    vi = np.linalg.inv(np.atleast_2d(np.cov(t.T)))
+    return np.round(np.sqrt(np.maximum(np.einsum('ij,jk,ik->i', d, vi, d), 0)), 1)
 
 
 def event_making_process(
@@ -54,7 +55,6 @@ def event_making_process(
 
 
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
-    grow()
     np.random.seed()
 
     gen = EventGenerator(
@@ -166,7 +166,7 @@ def get_djc_data(result, compute_spectators_dist=True):
             spectators_shower_dist = find_pcas(x_to_fit, PCA_n=2, min_hits=10)
 
             if spectators_shower_dist is None:
-                spectators_shower_dist = np.zeros(len(X), np.float)
+                spectators_shower_dist = np.zeros(len(X), np.float64)
 
             spectator_dist[np.argwhere(f)[:, 0]] = spectators_shower_dist
     else:
@@ -208,7 +208,9 @@ class DatasetCreator():
                  num_parallel_reading_threads=20,
                  include_tracks=True,
                  sample_isolated_particles=None,
-                 alter_muon_truth=False):
+                 alter_muon_truth=False,
+                 meta=None):
+        self.meta = dict(meta or {})
         self.output_path = output_path
         self.rechit_cut = rechit_cut
         self.sensor_data = sensor_data
@@ -297,7 +299,7 @@ class DatasetCreator():
     def rebuild_pu_samples(self, remaining=[]):
         print("\n\n\nBuilding and shuffling pu samples\n\n\n")
         all_samples = set(
-            np.arange(self.pu_iterator.get_total()) if self.pu_iterator is not None else np.array([], np.int).tolist())
+            np.arange(self.pu_iterator.get_total()) if self.pu_iterator is not None else np.array([], np.int64).tolist())
         all_samples = list(all_samples - set(remaining))
         np.random.shuffle(all_samples)
         self.pu_samples = remaining + all_samples
@@ -306,7 +308,7 @@ class DatasetCreator():
         print("\n\n\nBuilding and shuffling part samples\n\n\n")
         all_samples = set(
             np.arange(self.particles_iterator.get_total()) if self.particles_iterator is not None else np.array([],
-                                                                                                                np.int).tolist())
+                                                                                                                np.int64).tolist())
         all_samples = list(all_samples - set(remaining))
         np.random.shuffle(all_samples)
         self.particles_samples = remaining + all_samples
@@ -328,64 +330,20 @@ class DatasetCreator():
     def write_out(self, data):
         if data.qsize() == 0:
             return
-
-        if not is_laptop:
-            rs = [0]
-            Fs = []
-            Ts = []
-            total = 0
-            while data.qsize() > 0:
-                feat, truth = data.get()
-                Fs.append(feat)
-                Ts.append(truth)
-                total += len(feat)
-                rs.append(total)
-
-            rs = np.array(rs, np.int64)
-            F_full = np.concatenate(Fs, axis=0)
-            T_full = dict()
-
-            keys = Ts[0].keys()
-            for k in keys:
-                T_full[k] = np.concatenate([Ts[i][k] for i in range(len(Ts))])
-
-            if not is_laptop:
-                rechit_features = [SimpleArray(F_full, rs, name="recHitFeatures")]
-                truth_all = []
-                truth_all += [SimpleArray(T_full['t_idx'].astype(np.int32), rs, name='t_idx')]
-                truth_all += [SimpleArray(T_full['t_energy'].astype(np.float32), rs, name='t_energy')]
-                truth_all += [SimpleArray(T_full['t_pos'].astype(np.float32), rs, name='t_pos')]
-                truth_all += [SimpleArray(T_full['t_time'].astype(np.float32), rs, name='t_time')]
-                truth_all += [SimpleArray(T_full['t_pid'].astype(np.float32), rs, name='t_pid')]
-                truth_all += [SimpleArray(T_full['t_spectator'].astype(np.float32), rs, name='t_spectator')]
-                truth_all += [SimpleArray(T_full['t_fully_contained'].astype(np.float32), rs, name='t_fully_contained')]
-                truth_all += [SimpleArray(T_full['t_rec_energy'].astype(np.float32), rs, name='t_rec_energy')]
-                truth_all += [SimpleArray(T_full['t_is_unique'].astype(np.int32), rs, name='t_is_unique')]
-                # truth_all += [SimpleArray(T_full['t_only_minbias'].astype(np.int32), rs, name='t_only_minbias')]
-                # truth_all += [SimpleArray(T_full['t_shower_class'].astype(np.int32), rs, name='t_shower_class')]
-
-                print(F_full.shape, T_full['t_idx'].shape)
-                x = rechit_features + truth_all
-                y = []
-                z = []
-                traindata = TrainData_NanoML()
-                traindata._store(x, y, z)
-                #
-                # file = str(uuid.uuid4()) + '.djctd'
-                file = '%05d' % self.last_file_writing_index + '.djctd'
-                self.last_file_writing_index += 1
-                path = os.path.join(self.output_path, file)
-                with open(path, 'wb') as f:
-                    pickle.dump([12, 3], f)
-                print("Writing djc to", path)
-                traindata.writeToFile(path)
-
-        else:
-            dataset = RandomAccessPicklesWriter(data.qsize(),
-                                                  '/Users/shahrukhqasim/Workspace/NextCal/ShahRukhStudies/toydetector2/scripts/sample_events_multipart')
-            while data.qsize() > 0:
-                dataset.add(data.get())
-            dataset.close()
+        events = []
+        while data.qsize() > 0:
+            feat, truth = data.get()
+            ev = {'recHitFeatures': np.asarray(feat, np.float32)}
+            for k, dt in TRUTH_DTYPES.items():
+                v = np.asarray(truth[k]).astype(dt)
+                ev[k] = v if k == 't_pos' else v.reshape(-1)
+            events.append(ev)
+        name = '%05d' % self.last_file_writing_index
+        self.last_file_writing_index += 1
+        meta = dict(kind='events', feature_columns=FEATURE_COLUMNS, truth_columns=list(TRUTH_DTYPES),
+                    config=self.meta)
+        path = write_event_shard(os.path.join(self.output_path, name), events, meta=meta)
+        print("Wrote", len(events), "events to", path, flush=True)
 
     def data_writing_thread(self):
         num_written = 0
@@ -412,20 +370,17 @@ class DatasetCreator():
 
     def process(self):
         print("Starting processing...")
-        if self.particles_iterator is not None:
-            self.particles_iterator.start_parallel_retrieval_threads(self.num_parallel_reading_threads)
-        if self.pu_iterator is not None:
-            self.pu_iterator.start_parallel_retrieval_threads(self.num_parallel_reading_threads)
 
         self.loading_thread = threading.Thread(target=self.data_loading_thread, args=())
         self.writing_thread = threading.Thread(target=self.data_writing_thread, args=())
-        self.events_input_cache = (multiprocessing).Queue()
-        self.events_output_cache = (multiprocessing).Queue()
+        ctx = multiprocessing.get_context('fork')
+        self.events_input_cache = ctx.Queue()
+        self.events_output_cache = ctx.Queue()
 
         # Start processes which create events in parallel
         self.event_creator_processes = []
         for i in range(self.num_event_creation_processes):
-            p = multiprocessing.Process(
+            p = ctx.Process(
 		target=event_making_process, args=(
 			self.events_input_cache, 
 			self.events_output_cache, 
@@ -456,7 +411,3 @@ class DatasetCreator():
         self.loading_thread.join()
         self.writing_thread.join()
 
-        if self.particles_iterator is not None:
-            self.particles_iterator.close_parallel_retrieval_threads()
-        if self.pu_iterator is not None:
-            self.pu_iterator.close_parallel_retrieval_threads()

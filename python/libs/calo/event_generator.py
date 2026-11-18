@@ -1,7 +1,6 @@
 import time
 
 import numpy as np
-from matplotlib import pyplot as plt
 from scipy.sparse.csgraph import connected_components
 import calo.detector_math as dm
 from scipy import interpolate
@@ -13,7 +12,6 @@ from scipy import interpolate
 # db.set_experiment('event_merging_checks_v1')
 from calo.merging_ops import merge_hits
 from numba import njit
-import tensorflow as tf
 
 
 @njit
@@ -269,11 +267,12 @@ class EventGenerator():
             If some rechit doesn't have a particle assigned to it at time of geant simulation, that might be an issue.
             So far its never the case. So it should be good
             """
-            rechit_energy = tf.convert_to_tensor(self.rechit_energy * 1.0)
+            rechit_energy = self.rechit_energy * 1.0
             for simulation in simulations:
-                rechit_energy = tf.tensor_scatter_nd_add(rechit_energy, simulation['hit_particle_sensor_idx'][:, tf.newaxis], simulation['hit_particle_deposit'])
+                np.add.at(rechit_energy, np.asarray(simulation['hit_particle_sensor_idx']).astype(np.int64),
+                          simulation['hit_particle_deposit'])
 
-            self.rechit_energy = rechit_energy.numpy()
+            self.rechit_energy = rechit_energy
         else:
             for simulation in simulations:
                 self.rechit_energy[simulation['rechit_idx'].astype(np.int32)] = self.rechit_energy[
@@ -341,7 +340,7 @@ class EventGenerator():
                                       np.array(simulation['particles_first_active_impact_position_z']))
 
 
-            keep_this = np.ones_like(np.array(simulation['particles_first_active_impact_position_x']), np.bool)
+            keep_this = np.ones_like(np.array(simulation['particles_first_active_impact_position_x']), bool)
             if phase_cut != None:
                 # keep_phi_start = 0.4*np.pi/2 # TODO: np.random.uniform()
                 particles_first_active_impact_position_phi = np.where(particles_first_active_impact_position_phi<0, particles_first_active_impact_position_phi+2*np.pi, particles_first_active_impact_position_phi)
@@ -401,14 +400,14 @@ class EventGenerator():
             reduced_simulation['hit_particle_sensor_idx'] = np.concatenate(reduced_simulation['hit_particle_sensor_idx'], axis=0)
         else:
             reduced_simulation['hit_particle_id'] = np.array([], np.int32)
-            reduced_simulation['hit_particle_deposit'] = np.array([], np.float)
-            reduced_simulation['hit_particle_sensor_idx'] = np.array([], np.float)
+            reduced_simulation['hit_particle_deposit'] = np.array([], np.float64)
+            reduced_simulation['hit_particle_sensor_idx'] = np.array([], np.float64)
 
         return reduced_simulation
 
     def _merge_particles(self, simulation):
         t1 = time.time()
-        use_tf=True
+        use_tf=False   # TensorFlow removed: the numpy branches below give the same result
 
         first_sensor_indices = simulation['particles_first_active_impact_sensor_idx']
         ex2 = np.array(simulation['particles_first_active_impact_position_x'])
@@ -462,7 +461,7 @@ class EventGenerator():
         my = np.array(simulation['particles_first_active_impact_momentum_direction_y'])
         mz = np.array(simulation['particles_first_active_impact_momentum_direction_z'])
 
-        momentum_vectors =tf.concat((mx[..., tf.newaxis],my[..., tf.newaxis],mz[..., tf.newaxis]), axis=-1)
+        momentum_vectors = np.concatenate((mx[..., np.newaxis], my[..., np.newaxis], mz[..., np.newaxis]), axis=-1)
 
         angle_distances = dm.nxnAngles_tf(momentum_vectors, momentum_vectors)
         limit = np.deg2rad(5.0)
@@ -472,12 +471,12 @@ class EventGenerator():
 
         # angle_projection += [dm.angle_between_vectors([ex, ey, ez], [mx, my, mz])]
 
-        connection_adjacency_matrix = tf.logical_and(close_in_phi, close_in_eta)
-        connection_adjacency_matrix = tf.logical_and(close_in_angle, connection_adjacency_matrix)
+        connection_adjacency_matrix = np.logical_and(close_in_phi, close_in_eta)
+        connection_adjacency_matrix = np.logical_and(close_in_angle, connection_adjacency_matrix)
         if not self.merge_particles_with_tracks:
             dont_have_tracks = np.logical_not(should_include_track(simulation['particles_pdgid']))
             dont_have_tracks_nxn = np.logical_and(dont_have_tracks[..., np.newaxis], dont_have_tracks[np.newaxis, ...])
-            connection_adjacency_matrix = tf.logical_and(connection_adjacency_matrix, dont_have_tracks_nxn)
+            connection_adjacency_matrix = np.logical_and(connection_adjacency_matrix, dont_have_tracks_nxn)
 
         if use_tf:
             connection_adjacency_matrix = connection_adjacency_matrix.numpy()
@@ -523,8 +522,8 @@ class EventGenerator():
                 hits_particle_deposit = tf.convert_to_tensor(hits_particle_deposit)
                 hits_particle_sensor_idx = tf.convert_to_tensor(hits_particle_sensor_idx)
 
-            hits_particle_id = tf.gather_nd(labels, hits_particle_id[..., tf.newaxis])
-            hits_particle_id, hits_particle_sensor_idx, hits_particle_deposit = merge_hits(hits_particle_id.numpy(), hits_particle_sensor_idx.numpy(), hits_particle_deposit.numpy())
+            hits_particle_id = np.asarray(labels)[hits_particle_id]
+            hits_particle_id, hits_particle_sensor_idx, hits_particle_deposit = merge_hits(hits_particle_id, np.asarray(hits_particle_sensor_idx), np.asarray(hits_particle_deposit))
 
             for u in unique_labels:
                 combine_these = np.argwhere(labels == u)[:, 0]
@@ -623,29 +622,33 @@ class EventGenerator():
 
         hit_particle_deposit = hit_particle_deposit * self.all_sensors_scale[hit_particle_sensor_idx]
 
-        sort_idx = tf.argsort(hits_particle_id)
-        hits_particle_id = tf.gather_nd(hits_particle_id, sort_idx[..., tf.newaxis])
-        hit_particle_deposit = tf.gather_nd(hit_particle_deposit, sort_idx[..., tf.newaxis])
-        hit_particle_sensor_idx = tf.gather_nd(hit_particle_sensor_idx, sort_idx[..., tf.newaxis])
+        # numpy (was TensorFlow): a stable sort keeps tf.argsort's order of equal ids; np.bincount over the sorted ids is
+        # tf.math.segment_sum (length max id + 1, zero for ids without hits; 0/0 gives nan there, as before)
+        sort_idx = np.argsort(hits_particle_id, kind='stable')
+        hits_particle_id = hits_particle_id[sort_idx]
+        hit_particle_deposit = hit_particle_deposit[sort_idx]
+        hit_particle_sensor_idx = hit_particle_sensor_idx[sort_idx]
         segment_ids = hits_particle_id*1
 
-        indexing = hit_particle_sensor_idx[..., tf.newaxis]
+        indexing = hit_particle_sensor_idx
+        segment_sum = lambda w: np.bincount(segment_ids, weights=w) if len(segment_ids) else np.zeros(0)
 
         # hit_particle_deposit = tf.RaggedTensor.from_value_rowids(hit_particle_deposit, hits_particle_id)
         # hit_particle_sensor_idx = tf.RaggedTensor.from_value_rowids(hit_particle_sensor_idx, hits_particle_id)
         # hits_particle_id = tf.RaggedTensor.from_value_rowids(hits_particle_id, hits_particle_id)
 
-        deposit_sum_particles = tf.math.segment_sum(hit_particle_deposit, segment_ids)
-        particles_true_x  = tf.math.segment_sum(tf.gather_nd(self.all_sensors_x, indexing) * hit_particle_deposit, segment_ids) / deposit_sum_particles
-        particles_true_y = tf.math.segment_sum(tf.gather_nd(self.all_sensors_y, indexing) * hit_particle_deposit, segment_ids) / deposit_sum_particles
-        particles_true_z = tf.math.segment_sum(tf.gather_nd(self.all_sensors_z, indexing) * hit_particle_deposit, segment_ids) / deposit_sum_particles
+        deposit_sum_particles = segment_sum(hit_particle_deposit)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            particles_true_x = segment_sum(self.all_sensors_x[indexing] * hit_particle_deposit) / deposit_sum_particles
+            particles_true_y = segment_sum(self.all_sensors_y[indexing] * hit_particle_deposit) / deposit_sum_particles
+            particles_true_z = segment_sum(self.all_sensors_z[indexing] * hit_particle_deposit) / deposit_sum_particles
 
-        self.particles_true_x = particles_true_x.numpy()
-        self.particles_true_y = particles_true_y.numpy()
+        self.particles_true_x = particles_true_x
+        self.particles_true_y = particles_true_y
 
-        x = np.concatenate(((self.rechit_energy*0).astype(np.int32)-1, hits_particle_id.numpy()), axis=0)
-        y = np.concatenate((np.arange(len(self.rechit_energy)), hit_particle_sensor_idx.numpy()), axis=0)
-        z = np.concatenate((self.rechit_noise, hit_particle_deposit.numpy()), axis=0)
+        x = np.concatenate(((self.rechit_energy*0).astype(np.int32)-1, hits_particle_id), axis=0)
+        y = np.concatenate((np.arange(len(self.rechit_energy)), hit_particle_sensor_idx), axis=0)
+        z = np.concatenate((self.rechit_noise, hit_particle_deposit), axis=0)
 
         max_part_dep = self.get_particle_that_max_dep_on_sensor(x, y, z)
 
@@ -669,10 +672,10 @@ class EventGenerator():
         particles_only_minbias = np.concatenate((np.array(simulation['particles_only_minbias']), [False]), axis=-1)
         particles_shower_class = np.concatenate((np.array(simulation['particles_shower_class']), [-1]), axis=-1)
 
-        particles_true_x = np.concatenate((particles_true_x.numpy(), [0]), axis=-1)
-        particles_true_y = np.concatenate((particles_true_y.numpy(), [0]), axis=-1)
-        particles_true_z = np.concatenate((particles_true_z.numpy(), [0]), axis=-1)
-        deposit_sum_particles = np.concatenate((deposit_sum_particles.numpy(), [0]), axis=-1)
+        particles_true_x = np.concatenate((particles_true_x, [0]), axis=-1)
+        particles_true_y = np.concatenate((particles_true_y, [0]), axis=-1)
+        particles_true_z = np.concatenate((particles_true_z, [0]), axis=-1)
+        deposit_sum_particles = np.concatenate((deposit_sum_particles, [0]), axis=-1)
 
 
 
@@ -834,7 +837,7 @@ class EventGenerator():
             if self.reduce:
                 filt = self.rechit_energy > 0
                 if self.include_tracks:
-                    filt = np.concatenate((np.ones(len(self.track_hits_energy), np.bool), filt), axis=0)
+                    filt = np.concatenate((np.ones(len(self.track_hits_energy), bool), filt), axis=0)
 
                 result = {k: v[filt] for k, v in result.items()}
         else: 
@@ -976,12 +979,17 @@ class EventGenerator():
                 eta2_ += [e]
                 r2_ += [y]
 
-        f = interpolate.interp2d(pt2_, eta2_, r2_)
+        # The points form a regular grid (log10 pT in {-2, 1, 4} x eta in {1.5, 3.0}), where interp2d (removed from
+        # scipy) was bilinear interpolation: RegularGridInterpolator does the same. Inputs are clamped to the grid.
+        gp, ge = np.unique(pt2_), np.unique(eta2_)
+        grid = np.zeros((len(gp), len(ge)))
+        for p_, e_, r in zip(pt2_, eta2_, r2_):
+            grid[np.searchsorted(gp, p_), np.searchsorted(ge, e_)] = r
+        f = interpolate.RegularGridInterpolator((gp, ge), grid, method='linear')
 
-        res = pt * 0.0
-        for i in range(len(pt)):
-            res[i] = np.power(10, f(np.log10(pt[i]), eta[i]))
-        return res
+        lp = np.clip(np.log10(np.asarray(pt, np.float64)), gp[0], gp[-1])
+        le = np.clip(np.asarray(eta, np.float64), ge[0], ge[-1])
+        return np.power(10, f(np.stack([lp, le], axis=-1))) if len(lp) else np.asarray(pt, np.float64) * 0.0
         # return np.power(10, f(np.log10(pt), eta))
 
 
@@ -1018,8 +1026,8 @@ class EventGenerator():
         ez = np.concatenate([s['particles_first_active_impact_position_z'] for s in simulations])
         eeta, ephi, _ = dm.x_y_z_to_eta_phi_theta(ex, ey, ez)
 
-        eta_distance = tf.abs(eeta[:, np.newaxis] - eeta[np.newaxis, :])
-        phi_distance = dm.angle_diff_tf(ephi[:, tf.newaxis], ephi[tf.newaxis, :])
+        eta_distance = np.abs(eeta[:, np.newaxis] - eeta[np.newaxis, :])
+        phi_distance = dm.angle_diff(ephi[:, np.newaxis], ephi[np.newaxis, :])
 
         # Define the minimum quadratic distance between items in eta and phi spaces
         min_quad_distance = ep_distance ** 2

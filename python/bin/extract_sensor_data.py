@@ -1,37 +1,34 @@
-import gzip
-import pickle
-import sys
+"""Write the sensor table of a calorimeter variant (minicalo.get_sensor_data()) as an .npz file.
 
-import argh as argh
-import numpy as np
+  python3 extract_sensor_data.py <output.npz> [--calo v3|v4]
+
+run_simulations.py writes the same table to <output_path>/sensor_data.npz; this script makes it without simulating.
+"""
+import argparse
 import json
+import os
+
+import numpy as np
+
 from calo.calo_generator import CaloV3Generator, CaloV4Generator
-from calo.config import set_env, is_laptop
+from calo.config import ensure_tls, pythia_data
 
-def main(output_file, calo_type='v3'):
-    set_env()
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('output_file')
+    ap.add_argument('--calo', default='v3', choices=['v3', 'v4'])
+    a = ap.parse_args()
     import minicalo
+    spec = {'v3': CaloV3Generator, 'v4': CaloV4Generator}[a.calo]().generate()
+    minicalo.initialize(json.dumps(spec), pythia_data(), False, 1, 2, 3, 4)  # third argument is collect_full_data
+    sd = {k: np.asarray(v) for k, v in minicalo.get_sensor_data().items()}
+    out = a.output_file if a.output_file.endswith('.npz') else a.output_file + '.npz'
+    np.savez(out + '.tmp.npz', **sd)
+    os.replace(out + '.tmp.npz', out)
+    print("Sensor data (%d sensors) saved to %s for the %s calorimeter." % (len(sd['sensors_x']), out, a.calo))
 
-    if calo_type == 'v3':
-        CGenerator = CaloV3Generator
-    elif calo_type == 'v4':
-        CGenerator = CaloV4Generator
-    else:
-        raise NotImplementedError('Error')
 
-    calo_generator = CGenerator()
-
-    detector_specs = calo_generator.generate()
-    minicalo.initialize(json.dumps(detector_specs),
-                        '/afs/cern.ch/work/s/sqasim/workspace_phd_5/NextCal/pythia8306/share/Pythia8'
-                        if not is_laptop else '/Users/shahrukhqasim/Workspace/NextCal/miniCalo/pythia8-data',
-                        False, 1, 2, 3, 4)  # third argument is collect_full_data
-
-    sensor_data = minicalo.get_sensor_data()
-
-    with gzip.open(output_file, 'wb') as f:
-        pickle.dump(sensor_data, f)
-
-    print("Sensor data saved to %s for %s calorimeter."%(output_file, calo_type))
-
-argh.dispatch_command(main)
+if __name__ == '__main__':
+    ensure_tls()
+    main()

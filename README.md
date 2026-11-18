@@ -25,78 +25,78 @@ Cite as:
 ```
 
 ## Install / Compile
-The following docker container should be used to run the code in this repository:
-https://hub.docker.com/r/shahrukhqasim2/g4calo. The repository has to be manually
-compiled within the container. A container with a prebuilt package is coming soon.
+The code builds against a current Geant4 (tested: 11.4.3) and Pythia 8.3 (tested: 8.318), with pybind11 from pip and
+jsoncpp from the submodule. ROOT and fastjet are no longer needed. Any environment with `geant4-config`,
+`pythia8-config`, CMake >= 3.16, a C++17 compiler and Python 3 works (tested in the `cudabear_blackwell_oct_2026_base`
+apptainer image, Python 3.14). The old `containers/` recipes (Geant4 10.7, Pythia 8.308) are kept for reference.
 
-The singularity `.def` and `Dockerfile` are both available in `containers/` directory if the container needs
-to be built.
-
-```
-singularity pull docker://shahrukhqasim2/g4calo:latest
-```
-This step can take many hours to complete. As the result, a `.sif` file will be created in the
-current directory. Login to the `.sif` container:
-```
-singularity shell g4calo_latest.sif
-```
-If at CERN, `EOS` and `AFS` can also be mounted as follows:
-```
-singularity shell -B /afs -B /eos g4calo_latest.sif
-```
-Check out the repository:
 ```
 git clone https://github.com/shahrukhqasim/hg_toy_calorimeter.git
 cd hg_toy_calorimeter
-git submodule update --init --recursive
+git submodule update --init jsoncpp
+pip install -r requirements.txt
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+cmake --build build -j 16          # -> build/lib/minicalo.cpython-*.so
 ```
 
-And build:
-```
-mkdir build
-cd build
-cmake ..
-make -j
-cd ..
-```
+Porting notes (Geant4 10.7 -> 11, Pythia 8.2/8.30x -> 8.318):
+- `g4root.hh` no longer exists: `G4AnalysisManager.hh`.
+- Pythia's external random engine is a `shared_ptr`; Pythia's data directory is now the argument of
+  `minicalo.initialize` (it was hard-coded); a failed `Pythia::init()` now raises instead of passing silently.
+- `ParticleDecays:allowPhotonRadiation` was removed from Pythia 8.3 (it made `init()` fail) and is dropped.
+- `Tune:preferLHAPDF = 0`: the tune's PDF from Pythia's own grids (LHAPDF is not installed).
+- The calibration constants depend on the Geant4 version: rerun `calibrate.py` (below) instead of reusing
+  `sensor_data_v3_calibrated.bin`.
 
 ## Generating data
-As described in the paper, there are two steps to generate a datset with this calorimeter.
+As described in the paper, there are two steps to generate a dataset with this calorimeter.
 First individual simulations are generated which can be either single particle simulations
 or proton-proton interactions. A dataset of simulations is generated and then to generate
 events, simulations are sampled for every event without replacement.
 
+### Storage format
+Simulations and events are stored as columnar shards (`python/libs/calo/shards.py`), the layout of the fcc-ai-design
+training shards: one directory per shard with one `.npy` per column, `<group>_off.npy` offset arrays that cut the
+concatenated columns into records, and a `meta.json` (record count, columns, Geant4/Pythia versions, seeds, config).
+They are plain numpy files: read them anywhere with numpy (memory-mapped), no pickles, no container. This replaces
+`ra_pickles` (simulations) and the DeepJetCore `.djctd` files (events); TensorFlow and DeepJetCore are no longer used.
+
+```python
+from calo.shards import sim_library, event_shard
+sims = sim_library('data/mix')            # all simulation shards under a folder
+sim, gun = sims.get_element(0)            # minicalo result dict (+ the gun particle for single-particle samples)
+ev = event_shard('data/events/00000')     # one event shard
+hits = ev.record(0)                       # recHitFeatures [N, 10], t_idx, t_energy, t_pos [N, 3], ...
+```
+
 ### Setting environment:
-To set the environment once the code has been built, the build directory should be added
-to `PYTHONPATH`.
 ```
-cd python/bin
-export PYTHONPATH=$PYTHONPATH:`readlink -f ../../build/`:`readlink -f ../../build/lib/`:`readlink -f ../libs`
-cd ../..
+export PYTHONPATH=$PYTHONPATH:$PWD/build/lib:$PWD/python/libs
 ```
+Geant4 11 needs a larger static-TLS reserve when it is loaded as a Python module; the scripts set
+`GLIBC_TUNABLES=glibc.rtld.optional_static_tls=3145728` themselves (`calo.config.ensure_tls`).
 
 ### Generate simulations
-`run_simulation.py` script can be used to generate a set of simulations:
 ```
 cd python/bin
-python3 run_simulations.py minbias --cores=1
+python3 run_simulations.py configuration/production.ini single_mix     # or: python3 run_simulations.py minbias <out> --cores 1
 ```
-The simulations will be generated in `ra_pickles` format, as described here:
-https://github.com/shahrukhqasim/ra_pickles
+Each worker writes shards `<outpath>/<simtype>_<seed>_<chunk>/` of `num-simulations-per-file` simulations, plus
+`<outpath>/detector_spec.json` and `<outpath>/sensor_data.npz` (the sensor table).
 
-They are inherently stored as pickled numpy arrays and therefore, can be accessed
-outside the container, by only installing the `ra_pickles` package via
-`pip3 install ra-pickles`. The container should only be used for gerating events
-and simulations.
+### Calibrate
+```
+python3 run_simulations.py configuration/production.ini sim_calibration_dataset_em_v4
+python3 run_simulations.py configuration/production.ini sim_calibration_dataset_had_v4
+python3 calibrate.py --sensor-data <em outpath>/sensor_data.npz --em <em outpath> --had <had outpath> --out calib_v4.npz
+```
 
 ### Generate events
-`generate_events.py` script can be used to generate a set of events:
 ```
-cd python/bin
-python3 create_dataset.py example_datasets_config.ini test_dataset_cern
+python3 create_dataset.py configuration/datasets.ini <section>     # calibration_data = the calib_*.npz file
 ```
+Writes event shards `<output_folder>/<NNNNN>/` (`hit_off.npy` and per-hit `recHitFeatures` [N, 10] with the same
+columns as before, `t_idx`, `t_energy`, `t_pos`, `t_time`, `t_pid`, `t_spectator`, `t_fully_contained`, `t_rec_energy`,
+`t_is_unique`) and `dataset_config.json`. `num_events_per_djc_file` is still accepted (alias `num_events_per_file`).
 
-Here, first the HGCAL environment must have been sourced, to be able to
-export data in `.djctd` format.
-
-* Events export in ra_pickles format is coming soon.
+`configuration/quick_test.ini` runs the whole chain in a few minutes.

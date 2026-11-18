@@ -33,7 +33,7 @@
 
 #include "defines.h"
 
-#include "g4root.hh"
+#include "G4AnalysisManager.hh"
 //#include "g4cvs.hh"
 //#include "g4xml.hh"
 

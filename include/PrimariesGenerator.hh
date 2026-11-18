@@ -12,9 +12,6 @@
 #include <vector>
 #include "Pythia8/Pythia.h"
 
-#include "fastjet/JetDefinition.hh"
-#include "fastjet/ClusterSequence.hh"
-#include "fastjet/PseudoJet.hh"
 
 
 
@@ -52,8 +49,7 @@ private:
 protected:
     Pythia8::Pythia pythia_;
     Pythia8::Pythia pythia_qqbar2ttbar;
-    fastjet::JetDefinition* jetDef_;
-    Pythia8::RndmEngine* random_engine;
+    Pythia8::RndmEnginePtr random_engine;   // shared by both Pythia instances (Pythia 8.3 takes a shared_ptr)
 
     double xorig_ = 0;
     double yorig_ = 0;

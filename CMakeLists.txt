@@ -1,84 +1,52 @@
-# $Id: CMakeLists.txt 104871 2017-06-23 14:17:13Z gcosmo $
-
 #----------------------------------------------------------------------------
-# Setup the project
+# High-granularity toy calorimeter: the Geant4 simulation as a Python module (minicalo).
 #
-cmake_minimum_required(VERSION 2.6 FATAL_ERROR)
-MESSAGE(${CMAKE_VERSION})
-project(B4a)
+# Builds against a current Geant4 (tested with 11.4.3) and Pythia 8.3 (tested with 8.318). pybind11 comes from
+# the Python environment (pip install pybind11), jsoncpp from the submodule. No ROOT and no fastjet are needed.
+#
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+#         -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+#   cmake --build build -j 16
+#----------------------------------------------------------------------------
+cmake_minimum_required(VERSION 3.16)
+project(hg_toy_calorimeter CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(Geant4 REQUIRED ui_all vis_all)
+find_package(Geant4 REQUIRED)
+set(PYBIND11_FINDPYTHON ON)
+find_package(pybind11 CONFIG REQUIRED)
 
-include(${Geant4_USE_FILE})
-include_directories(jsoncpp/include)
-include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(/usr/local/include/root/)
-include_directories(/usr/local/root/)
-include_directories(${Geant4_INCLUDE_DIRS})
+# Pythia 8: only the include and lib dirs (pythia8-config --cxxflags carries an old -std= flag)
+execute_process(COMMAND pythia8-config --includedir OUTPUT_VARIABLE PY8_INC OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND pythia8-config --libdir OUTPUT_VARIABLE PY8_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT PY8_INC)
+    message(FATAL_ERROR "pythia8-config not found on PATH")
+endif()
 
-include_directories(/usr/local/include/fastjet)
-include_directories(/fastjet-install/include/)
-#include_directories(../pythia8306/include)
-include_directories(/pythia8308/include/)
+# jsoncpp (submodule), static so the module has no extra runtime dependency
+set(JSONCPP_WITH_TESTS OFF CACHE BOOL "" FORCE)
+set(JSONCPP_WITH_POST_BUILD_UNITTEST OFF CACHE BOOL "" FORCE)
+set(JSONCPP_WITH_PKGCONFIG_SUPPORT OFF CACHE BOOL "" FORCE)
+set(JSONCPP_WITH_CMAKE_PACKAGE OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+set(BUILD_OBJECT_LIBS OFF CACHE BOOL "" FORCE)
+add_subdirectory(jsoncpp EXCLUDE_FROM_ALL)
 
-add_subdirectory(pybind11)
-
-
-set(CoreFiles src/Calorimeter.cc
-        include/Calorimeter.hh
+set(CoreFiles
+        src/Calorimeter.cc
         src/PrimariesGenerator.cc
-        include/PrimariesGenerator.hh
         src/B4DetectorConstruction.cc
         src/B4aActionInitialization.cc
         src/B4aSteppingAction.cc
         src/B4PartGeneratorBase.cc
         src/B4RunAction.cc
         src/B4aEventAction.cc
-        src/SensorContainer.cc
-        )
+        src/SensorContainer.cc)
 
 pybind11_add_module(minicalo src/minicalo_library.cc ${CoreFiles})
-add_executable(test_cases_library test/test_cases_library.cc ${CoreFiles})
-
-
-add_subdirectory(jsoncpp)
-
-
-set(important_libraries ${Geant4_LIBRARIES} jsoncpp_lib /fastjet-install/lib/libfastjet.so /pythia8308/lib/libpythia8.so)
-
-#set(important_libraries ${Geant4_LIBRARIES} jsoncpp_lib /pythia8308/lib/libpythia8.so /fastjet-install/lib/libfastjet.so)
-#set(important_libraries ${Geant4_LIBRARIES} jsoncpp_lib /Users/shahrukhqasim/Workspace/NextCal/pythia8306/lib/libpythia8.dylib /usr/local/lib/libfastjet.dylib)
-#set(important_libraries ${Geant4_LIBRARIES} jsoncpp_lib /afs/cern.ch/work/s/sqasim/workspace_phd_5/NextCal/pythia8306/lib/libpythia8.so /afs/cern.ch/work/s/sqasim/workspace_phd_5/NextCal/fastjet-install/lib/libfastjet.so)
-
-
-message( ${Geant4_LIBRARIES})
-target_link_libraries(minicalo PRIVATE ${important_libraries})
-target_link_libraries(test_cases_library PRIVATE pybind11::embed ${important_libraries})
-
-#target_link_libraries(json_test ${JsonCppLib} ${Geant4_LIBRARIES})
-#----------------------------------------------------------------------------
-# Copy all scripts to the build directory, i.e. the directory in which we
-# build B4a. This is so that we can run the executable directly because it
-# relies on these scripts being in the current working directory.
-#
-set(EXAMPLEB4A_SCRIPTS
-  exampleB4a.out
-  exampleB4.in
-  gui.mac
-  init_vis.mac
-  plotHisto.C
-  run1.mac
-  run2.mac
-  vis.mac
-  batchrun.mac
-  batchscript.sh
-  env.sh
-  )
-
-foreach(_script ${EXAMPLEB4A_SCRIPTS})
-  configure_file(
-    ${PROJECT_SOURCE_DIR}/${_script}
-    ${PROJECT_BINARY_DIR}/${_script}
-    COPYONLY
-    )
-endforeach()
+target_include_directories(minicalo PRIVATE ${PROJECT_SOURCE_DIR}/include ${PY8_INC})
+target_link_directories(minicalo PRIVATE ${PY8_LIBDIR})
+target_link_libraries(minicalo PRIVATE ${Geant4_LIBRARIES} jsoncpp_static pythia8)

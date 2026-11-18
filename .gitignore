@@ -18,3 +18,5 @@ data
 *.pkl
 *.jpg
 *.png
+data_*.log
+build.log

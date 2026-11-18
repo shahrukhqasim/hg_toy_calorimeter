@@ -1,9 +1,6 @@
 import numpy as np
 import time
-import pandas as pd
 from numba import njit
-import matplotlib.pyplot as plt
-import tensorflow as tf
 
 @njit
 def _merge_hits(particle_id, deposits, sensor_idx):

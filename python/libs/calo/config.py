@@ -1,45 +1,40 @@
+"""Environment helpers for running the Geant4 module (minicalo).
+
+Geant4 11 finds its data sets from its own installation (or from the G4*DATA variables that geant4.sh sets), so
+nothing is hard-coded here any more; the 10.7 data paths that set_env() used to force are gone.
+"""
 import os
-import json
+import shutil
+import subprocess
+import sys
 
-is_laptop = False
-if os.path.exists('/Users/shahrukhqasim/Workspace'):
-    is_laptop=True
+is_laptop = False       # kept for old scripts; nothing in the pipeline depends on the machine any more
 
-
-is_fi = False
-if os.path.exists('/mnt/home/sqasim/ceph/Workspace'):
-    is_fi = True
-
-
-if is_laptop:
-    binary_path = '/bin/exampleB4a'
-else:
-    binary_path = '/afs/cern.ch/work/s/sqasim/workspace_phd_5/NextCal/miniCalo/build3/exampleB4a'
+# Geant4's shared libraries need more static TLS than glibc reserves for dlopen'ed modules (Geant4 11.x): without it
+# importing minicalo fails ("cannot allocate memory in static TLS block"). The variable is read at interpreter start,
+# so ensure_tls() re-executes the script with it. 3 MB is what fcc-ai-design uses (g4sim/python/g4env.py): 2 MB is the
+# minimum for Geant4 11.4, 16 MB overflows thread stacks.
+TLS_TUNABLE = "glibc.rtld.optional_static_tls=3145728"
 
 
-
-# if is_laptop:
-#     detector_specs_file = '/scripts/toydetector/detector_specs.json'
-# elif is_fi:
-#     detector_specs_file = '/mnt/ceph/users/sqasim/Workspace/NextCal/ShahRukhStudies/scripts/toydetector/detector_specs.json'
-# else:
-#     detector_specs_file = '/afs/cern.ch/work/s/sqasim/workspace_phd_5/NextCal/ShahRukhStudies/scripts/toydetector/detector_specs.json'
-#
-# with open(detector_specs_file, 'r') as f:
-#     detector_specs = json.load(f)
+def ensure_tls():
+    if sys.platform.startswith("linux") and TLS_TUNABLE not in os.environ.get("GLIBC_TUNABLES", ""):
+        old = os.environ.get("GLIBC_TUNABLES")
+        os.environ["GLIBC_TUNABLES"] = TLS_TUNABLE + (":" + old if old else "")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def set_env():
-    if is_laptop:
-        os.environ["G4PARTICLEXSDATA"]="/usr/local/share/Geant4-10.7.2/data/G4PARTICLEXS3.1.1"
-        os.environ["G4LEDATA"]="/usr/local/share/Geant4-10.7.2/data/G4EMLOW7.13"
-        os.environ["G4LEVELGAMMADATA"]="/usr/local/share/Geant4-10.7.2/data/PhotonEvaporation5.7"
-        os.environ["G4ENSDFSTATEDATA"]="/usr/local/share/Geant4-10.7.2/data"
-        os.environ["G4VIS_BUILD_OPENGLX_DRIVER"]="1"
-    else:
-        os.environ["G4PARTICLEXSDATA"]="/usr/local/geant4/10.7.1/share/Geant4-10.7.2/data/G4PARTICLEXS3.1.1"
-        os.environ["G4LEDATA"]="/usr/local/geant4/10.7.1/share/Geant4-10.7.2/data/G4EMLOW7.13"
-        os.environ["G4LEVELGAMMADATA"]="/usr/local/geant4/10.7.1/share/Geant4-10.7.2/data/PhotonEvaporation5.7"
-        os.environ["G4ENSDFSTATEDATA"]="/usr/local/geant4/10.7.1/share/Geant4-10.7.2/data/G4ENSDFSTATE2.3"
-        os.environ["G4VIS_BUILD_OPENGLX_DRIVER"]="1"
+    """Kept for compatibility; Geant4 11 needs no data paths from here."""
+    pass
 
+
+def pythia_data(conf=None):
+    """Pythia's xmldoc directory: the config key pythia8_data, else $PYTHIA8DATA, else pythia8-config --xmldoc."""
+    if conf is not None and 'pythia8_data' in conf:
+        return str(conf['pythia8_data'])
+    if os.environ.get('PYTHIA8DATA'):
+        return os.environ['PYTHIA8DATA']
+    if shutil.which('pythia8-config'):
+        return subprocess.check_output(['pythia8-config', '--xmldoc'], text=True).strip()
+    raise RuntimeError("Pythia data not found: set PYTHIA8DATA, put pythia8-config on PATH or set pythia8_data")

@@ -64,23 +64,24 @@ void PrimariesGenerator::init_pythia(Pythia8::Pythia *pythia, bool qqbar2ttbar) 
     else
         pythia->readString("SoftQCD:inelastic = on");
 
-    pythia->readString("Tune:preferLHAPDF = 2");
+    // the tune's PDF from Pythia's own grid files (no LHAPDF in the container; the old 8.2 build had none either)
+    pythia->readString("Tune:preferLHAPDF = 0");
     pythia->readString("Main:timesAllowErrors = 10000");
     pythia->readString("Check:epTolErr = 0.01");
     pythia->readString("Beams:setProductionScalesFromLHEF = off");
     pythia->readString("SLHA:minMassSM = 1000.");
     pythia->readString("ParticleDecays:limitTau0 = on");
     pythia->readString("ParticleDecays:tau0Max = 10");
-    pythia->readString("ParticleDecays:allowPhotonRadiation = on");
+    // ParticleDecays:allowPhotonRadiation (Pythia 8.2) no longer exists in Pythia 8.3 and makes init() fail
 
-    pythia->init();
+    if (!pythia->init())
+        throw std::runtime_error("Pythia initialization failed (see the PYTHIA messages above)");
     std::cout << "Pythia initialized..." << std::endl;
 }
 
 PrimariesGenerator::PrimariesGenerator(std::string pythiadata, int seed_0, int seed_1, int seed_2, int seed_3) :
-        pythia_("/Users/shahrukhqasim/Workspace/NextCal/miniCalo/pythia8-data"),
-        pythia_qqbar2ttbar("/Users/shahrukhqasim/Workspace/NextCal/miniCalo/pythia8-data"),
-        jetDef_(new fastjet::JetDefinition(fastjet::antikt_algorithm, 0.4)) {
+        pythia_(pythiadata),
+        pythia_qqbar2ttbar(pythiadata) {
 
 
     G4INCL::Random::setGenerator(new G4INCL::Ranecu());
@@ -88,8 +89,7 @@ PrimariesGenerator::PrimariesGenerator(std::string pythiadata, int seed_0, int s
     init_pythia(&pythia_, false);
     init_pythia(&pythia_qqbar2ttbar, true);
 
-    random_engine = new MixMaxRndm(seed_0, seed_1, seed_2, seed_3);
-    MixMaxRndm*casted_rand = (MixMaxRndm*)random_engine;
+    random_engine = std::make_shared<MixMaxRndm>(seed_0, seed_1, seed_2, seed_3);
 
     pythia_.rndm.rndmEnginePtr(random_engine);
     pythia_qqbar2ttbar.rndm.rndmEnginePtr(random_engine);
