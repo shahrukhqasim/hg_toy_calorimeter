@@ -16,6 +16,7 @@ import configparser
 import json
 import multiprocessing
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -46,6 +47,25 @@ def _versions():
     return out
 
 
+def _write_once(path, write, suffix=''):
+    """Write a file that every job of a production writes with the same content: skip it if it exists, write to a
+    per-process temporary file and rename. Many jobs share one output folder, and on a network file system (GlusterFS)
+    concurrent renames onto the same name can fail ("Stale file handle"); that only means another job wrote it."""
+    if os.path.exists(path):
+        return
+    tmp = '%s.%s.%d.tmp%s' % (path, socket.gethostname(), os.getpid(), suffix)
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    except OSError as e:
+        if not os.path.exists(path):
+            raise
+        print("note: %s was written by another job (%s)" % (path, e), flush=True)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def detector_specs_for(conf):
     def f(k):
         return float(conf[k]) if k in conf else None
@@ -70,11 +90,9 @@ def work(worker, simtype, output_path, num_events, num_events_per_file, conf, ve
     calo_type, detector_specs = detector_specs_for(conf)
     minicalo.initialize(json.dumps(detector_specs), pythia_data(conf), False, *seeds)  # third: collect_full_data
     sensor_file = os.path.join(output_path, 'sensor_data.npz')
-    if worker == 0 and not os.path.exists(sensor_file):     # the sensor table (calibrate.py starts from it)
-        sd = {k: np.asarray(v) for k, v in minicalo.get_sensor_data().items()}
-        tmp = '%s.%d.tmp.npz' % (sensor_file, os.getpid())   # many batch jobs may write the same folder at once
-        np.savez(tmp, **sd)
-        os.replace(tmp, sensor_file)
+    if worker == 0:                                       # the sensor table (calibrate.py starts from it)
+        _write_once(sensor_file, lambda p: np.savez(p, **{k: np.asarray(v) for k, v in minicalo.get_sensor_data().items()}),
+                    suffix='.npz')
 
     if 'pdgid' in conf:
         particle_pdgid = [int(x) for x in str(conf['pdgid']).split(',')]
@@ -137,10 +155,7 @@ def main(simtype, output_path, cores=10, num_simulations=1000000, num_simulation
         raise ValueError('Wrong simtype %s: select from %s' % (simtype, sorted(ALLOWED)))
     os.makedirs(output_path, exist_ok=True)
     _, spec = detector_specs_for(conf)
-    tmp = os.path.join(output_path, 'detector_spec.json.%d.tmp' % os.getpid())
-    with open(tmp, 'w') as f:
-        json.dump(spec, f)
-    os.replace(tmp, os.path.join(output_path, 'detector_spec.json'))
+    _write_once(os.path.join(output_path, 'detector_spec.json'), lambda p: json.dump(spec, open(p, 'w')))
     versions = _versions()
     print("Going to do", simtype, 'on', cores, 'cores;', versions, flush=True)
 
