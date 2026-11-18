@@ -13,6 +13,10 @@ project(hg_toy_calorimeter CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# No link-time optimisation. pybind11 adds -flto to Release builds unless this is set; with it, some builds of the
+# unchanged code segfaulted while the module was imported (static initialisation, after numpy was loaded) and others
+# did not, depending only on where the tree was built. Builds without LTO, and debug builds, never crashed.
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
 
 find_package(Geant4 REQUIRED)
 set(PYBIND11_FINDPYTHON ON)
