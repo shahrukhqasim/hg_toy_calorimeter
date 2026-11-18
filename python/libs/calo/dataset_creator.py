@@ -223,7 +223,8 @@ class DatasetCreator():
                  include_tracks=True,
                  sample_isolated_particles=None,
                  alter_muon_truth=False,
-                 meta=None):
+                 meta=None,
+                 first_file=0):
         self.meta = dict(meta or {})
         self.loading_error = None
         self.worker_error = None
@@ -234,7 +235,7 @@ class DatasetCreator():
         self.num_events_per_djc_file = num_events_per_djc_file
         self.num_events_total = num_events_total
         self.min_hits_cut = min_hits_cut
-        self.last_file_writing_index = 0
+        self.last_file_writing_index = first_file
         self.compute_spectators_dist = compute_spectators_dist
         self.num_event_creation_processes = num_event_creation_processes
 

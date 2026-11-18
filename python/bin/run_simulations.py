@@ -72,8 +72,9 @@ def work(worker, simtype, output_path, num_events, num_events_per_file, conf, ve
     sensor_file = os.path.join(output_path, 'sensor_data.npz')
     if worker == 0 and not os.path.exists(sensor_file):     # the sensor table (calibrate.py starts from it)
         sd = {k: np.asarray(v) for k, v in minicalo.get_sensor_data().items()}
-        np.savez(sensor_file + '.tmp.npz', **sd)
-        os.replace(sensor_file + '.tmp.npz', sensor_file)
+        tmp = '%s.%d.tmp.npz' % (sensor_file, os.getpid())   # many batch jobs may write the same folder at once
+        np.savez(tmp, **sd)
+        os.replace(tmp, sensor_file)
 
     if 'pdgid' in conf:
         particle_pdgid = [int(x) for x in str(conf['pdgid']).split(',')]
@@ -136,8 +137,10 @@ def main(simtype, output_path, cores=10, num_simulations=1000000, num_simulation
         raise ValueError('Wrong simtype %s: select from %s' % (simtype, sorted(ALLOWED)))
     os.makedirs(output_path, exist_ok=True)
     _, spec = detector_specs_for(conf)
-    with open(os.path.join(output_path, 'detector_spec.json'), 'w') as f:
+    tmp = os.path.join(output_path, 'detector_spec.json.%d.tmp' % os.getpid())
+    with open(tmp, 'w') as f:
         json.dump(spec, f)
+    os.replace(tmp, os.path.join(output_path, 'detector_spec.json'))
     versions = _versions()
     print("Going to do", simtype, 'on', cores, 'cores;', versions, flush=True)
 

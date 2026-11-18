@@ -2,13 +2,17 @@
 simulations (and pileup simulations) without replacement, adds noise, applies the calibration and the noise cut, and
 assigns truth.
 
-  python3 create_dataset.py <config.ini> <section>
+  python3 create_dataset.py <config.ini> <section> [--num-events N] [--first-file F]
+
+--num-events / --first-file split one dataset over many batch jobs writing into the same output_folder: job k makes
+N events into the files F, F + 1, ... (e.g. F = k * N / num_events_per_file), so the jobs never write the same file.
 
 Reads the simulation shards under particles_folder / pu_folder and writes event shards to output_folder
 (<output_folder>/<NNNNN>/, calo/dataset_creator.py documents the columns; read them with calo.shards.event_shard).
 The calibration file (calibration_data, or $HG_TOY_CALORIMETER_CALIBRATION_DATA) is the .npz that calibrate.py writes;
 the old gzip-pickled sensor_data_*_calibrated.bin files are still read.
 """
+import argparse
 import configparser
 import gzip
 import json
@@ -45,8 +49,13 @@ def library_or_none(folder, needed):
 
 
 if __name__ == '__main__':
-    config_file = sys.argv[1]
-    section = sys.argv[2]
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('config_file')
+    ap.add_argument('section')
+    ap.add_argument('--num-events', type=int, default=None, help='events to make (default: num_events_total)')
+    ap.add_argument('--first-file', type=int, default=0, help='number of the first output file')
+    args = ap.parse_args()
+    config_file, section = args.config_file, args.section
     config = configparser.ConfigParser()
     config.read(config_file)
     sec = config[section]
@@ -54,7 +63,7 @@ if __name__ == '__main__':
     particles_folder = sec['particles_folder']
     pu_folder = sec.get('pu_folder', 'none')
     output_folder = sec['output_folder']
-    num_events_total = int(sec['num_events_total'])
+    num_events_total = args.num_events if args.num_events is not None else int(sec['num_events_total'])
 
     cut = np.float64(sec['noise_cut']) if 'noise_cut' in sec else 0.0009
     print("Using cut: ", cut)
@@ -125,7 +134,9 @@ if __name__ == '__main__':
 
     meta = dict(config_file=os.path.abspath(config_file), section=section, settings=dict(sec),
                 calibration_data=os.path.abspath(calib_path))
-    with open(os.path.join(output_folder, 'dataset_config.json'), 'w') as f:
+    meta.update(num_events=num_events_total, first_file=args.first_file)
+    cfg_name = 'dataset_config.json' if args.first_file == 0 else 'dataset_config_%05d.json' % args.first_file
+    with open(os.path.join(output_folder, cfg_name), 'w') as f:
         json.dump(meta, f, indent=1)
 
     dataset_creator = DatasetCreator(pu_iterator=pu_iterator,
@@ -145,5 +156,6 @@ if __name__ == '__main__':
                                      include_tracks=include_tracks,
                                      sample_isolated_particles=sample_isolated_particles,
                                      alter_muon_truth=alter_muon_truth,
-                                     meta=meta)
+                                     meta=meta,
+                                     first_file=args.first_file)
     dataset_creator.process()
