@@ -12,3 +12,6 @@ copy them to `$H`, or change `H`, to reproduce elsewhere.
   (10,000 training and 1,000 test events: 60 particles + 200 pileup collisions in a random 30° φ slice).
 - `single.sbatch`: test events with one particle + 200 pileup over the full detector
   (`configuration/single_pu200.ini`, 50 events per task): `sbatch -J single_pu200 --array=0-7 single.sbatch`.
+- `compute_performance.sbatch SCENARIO`: the pileup scan (one particle + 40 … 200 pileup, full detector, 2,000 events
+  each; `configuration/compute_performance.ini`):
+  `for s in pu040 pu080 pu120 pu160 pu200; do sbatch -J cp_$s --array=0-19 compute_performance.sbatch $s; done`
